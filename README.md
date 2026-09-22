@@ -6,7 +6,11 @@
 > after that tag — `git diff pre-task-scaffold..main` is exactly what was built in the hour.
 
 ## Summary
-<!-- TASK: 2–3 sentences — what this does, for whom, and what "done" means here. -->
+A small sandbox orchestrator for AI agents: `POST /sandboxes` puts a job on a Redis queue, a worker starts
+one hardened HTTP container per job and returns its URL, and a reaper enforces TTLs and cleans up leaks. It
+ships with SLOs, a lifecycle dashboard, alerts and a runbook, plus A/B worker pools (stable/canary) with
+deterministic, weight-based routing. "Done" here means task steps 1–4 on `main`, with `make lint test smoke`
+green. Step 5 (metric-driven cutover) was cut. See [Time log](#time-log).
 
 ## Run it
 ```bash
@@ -44,14 +48,14 @@ Prometheus ──scrape /metrics──▶ api :8000, worker :9100   (SLO burn-ra
 ## Decisions & trade-offs
 | Decision | Why | Trade-off / revisit when |
 |---|---|---|
-| Sandbox row written *before* enqueue; enqueue failure marks it `failed` + 503 | Worker always finds its row; no sandbox is left looking `queued` forever | Retry is safe with an `Idempotency-Key`; without one, a retry creates a new sandbox |
+| Scope: steps 1–4 done properly, one end-to-end slice each; step 5 cut | A working, observable core is worth more than five half-built steps. Each slice shipped green before the next started | A/B was built in parallel and merged afterwards; the cutover exists only as a design in `PLAN.md` |
+| Sandbox row written *before* enqueue; enqueue failure marks it `failed` + 503 | Worker always finds its row, a fast worker can't be overwritten by a late API write, no sandbox sits `queued` forever | Retry is safe with an `Idempotency-Key`; without one, a retry creates a new sandbox. An API crash between commit and enqueue leaves a `queued` row (limitation #2) |
 | Optional `Idempotency-Key` on `POST /sandboxes`: unique column, insert first, replay on conflict | A client retry (timeout, 503, agent loop) must not start a second container. The DB constraint settles concurrent duplicates, so there's no check-then-insert race | Keys are global (no tenants yet) and never expire. `create_all` won't add the column to an existing DB: run `ALTER TABLE sandboxes ADD COLUMN idempotency_key VARCHAR(64) UNIQUE` or `make down && make up` |
 | Launch bounded by `LAUNCH_TIMEOUT_S` (45s) inside arq's `job_timeout` (90s), checked at startup | When arq's timeout fires it *cancels* the job: no retry, the row stays `starting`, and nothing reaches `jobs_total` or the alerts. Our timeout goes through retry → `failed` | The validator requires launch + container cleanup (3 × `DOCKER_TIMEOUT_S`) + 2 DB writes ≤ `job_timeout`, hence 90s |
 | Worker drains for 8s on SIGTERM (`job_completion_wait`) | Deploys, including the A/B cutover, stop cancelling jobs in the middle of a launch | Jobs still running after 8s are cancelled and re-run (`starting` is re-startable) |
 | `asyncio.timeout` around enqueue | arq sets only a *connect* timeout; a hung Redis would otherwise hang the request | No retry on enqueue: fail fast, caller retries |
 | Worker skips sandboxes not in `queued`/`starting` | Queue delivery is at-least-once; a redelivered job must not start a sandbox twice | Relies on the DB row, not on arq's result store (`keep_result=0`) |
 | `jobs_enqueued_total{outcome}` on the producer | Producer health visible separately from HTTP 5xx | 503s also burn the API SLO; no separate alert yet |
-| `url`/`error` columns added in slice 1 | `create_all` never alters existing tables | Slice 2 still needed `DROP TABLE` on the dev DB for `expires_at`; tests now drop+create. Alembic before production |
 | **SHORTCUT:** worker mounts the Docker socket, runs as root | Fastest real "container per job"; the socket is root-equivalent whatever uid holds it | Not an isolation boundary. Real platform: gVisor/Firecracker/k8s behind a narrow API; worker can't run on Cloud Run (Terraform left as-is) |
 | Sandboxes on their own `duvo-sandboxes` network, published on 127.0.0.1 only | Untrusted agent code can't reach Postgres/Redis/API (verified with `nc`) | No egress policy yet (sandboxes can reach the internet) |
 | Hardened containers: uid 65534, read-only FS, `cap_drop=ALL`, no-new-privileges, 64 MiB / 0.25 CPU / 64 pids | Cheap doors closed; one sandbox can't starve the host | Limits are global, not per sandbox type |
@@ -78,11 +82,11 @@ Prometheus ──scrape /metrics──▶ api :8000, worker :9100   (SLO burn-ra
 | Admission cap (`SANDBOX_MAX_ACTIVE`, 429 + Retry-After) | A burst can't exhaust the host; k6 treats 429 as healthy backpressure | Count-then-insert is a soft cap under concurrency |
 | Liveness (`/healthz`) ≠ readiness (`/readyz`) | A DB blip must not trigger a restart storm | — |
 | Deterministic job ids | Duplicate requests don't double-process while a job is queued/running | Window ends when the job finishes; true exactly-once needs DB-level guards |
-| Write status *before* enqueue, roll back on failure | A fast worker can't be overwritten by a late API write | Brief "queued" state if the process dies between the two steps |
 | Prometheus pull for metrics, OTel for traces + logs | Matches a Prometheus/Grafana shop; deterministic metric names | On Cloud Run use Managed Service for Prometheus or OTLP metrics |
 | Route templates as metric labels, unknown HTTP methods → `OTHER` | Bounded cardinality whatever callers send (the method is caller input: `curl -X <random>` would otherwise add a series per request) | — |
 | No tracing of the worker's Redis poll loop / `/metrics` scrapes | Keeps traces about real work, not polling | Redis latency comes from metrics instead |
-| `create_all` at startup | Speed for a 1-hour task | Alembic migrations as a release step before >1 replica |
+| **SHORTCUT:** `create_all` at startup, no migrations | Speed for a 1-hour task | `create_all` never alters tables: adding `expires_at` / `idempotency_key` meant `DROP TABLE` or a manual `ALTER` on the dev DB (tests drop and recreate). Alembic as a release step before >1 replica |
+| Burn-rate alerts for the API SLOs, threshold alerts for the sandbox SLOs Faster to build in the hour. Start failures page at 5× burn (> 5% failed vs a 1% budget), and freshness opens a ticket at 1× burn (p95 > 10s) | Noisy at low traffic and blind to a slow trickle. See [SLO known gaps](docs/SLO.md#known-gaps) |
 | One uvicorn process per container | Simple metrics + predictable memory; scale with replicas | — |
 
 ## Reliability & observability
@@ -128,7 +132,7 @@ most severe first:
 |---|---|---|---|---|
 | 1 | Tenant isolation | No authn and no owner on a sandbox: any caller can list and read every sandbox, including its URL. `error` returns raw exception text | Cross-tenant data exposure. Deliberately not patched: a tenant header without authn is theatre | Authn at the edge (IAP / JWT) → `tenant_id` claim → owner column, every query scoped, 404 for other tenants' ids, idempotency unique per `(tenant_id, key)` |
 | 2 | Idempotency / stuck state | Nothing sweeps `queued`/`starting` rows that have no live job. That happens when the API dies between commit and enqueue, or when a job is cancelled on its last try (arq then drops it without calling our handler) | The sandbox never resolves and holds an admission-cap slot forever: the reaper only reconciles containers and `running`/`stopping` rows. Enough of them and every `POST` gets 429 | **Detected since Slice 3:** `SandboxQueueStalled` / `SandboxStuckInTransition` on `sandbox_oldest_in_status_seconds`. Still open, the automatic fix: reconciler re-enqueues stale `queued` rows (safe thanks to the deterministic job id and the status guard) and fails `starting` rows older than `job_timeout × max_tries` |
-| 3 | Timeouts | arq's Redis pool only has a *connect* timeout. `/metrics` calls `zcard` with no bound, and the worker's poll can block on a half-open connection | A hung Redis hangs the API scrape (TargetDown pages the API, the wrong component) and stalls the worker | `asyncio.timeout(redis_timeout_s)` around `zcard`, plus a pool with `socket_timeout` |
+| 3 | Timeouts | arq's Redis pool only has a *connect* timeout. `/metrics` is bounded now (Slice 4: `asyncio.timeout` around the per-pool `zcount`), but the worker's poll can still block on a half-open connection | A hung Redis stalls the worker without any error | A pool with `socket_timeout` |
 | 4 | Unbounded inputs | The global cap (`SANDBOX_MAX_ACTIVE`) counts and then inserts in separate steps, and there's no per-caller quota | Concurrent `POST`s overshoot the cap, and one caller can take every slot | Count and insert atomically (advisory lock or a counter row), plus a per-tenant quota |
 | 5 | Unsafe retries | The worker retries *every* exception, including ones that can't succeed (bad input, bugs) | Wasted attempts, and the `failed` signal arrives late | Classify errors and fail non-retryable ones on the first try |
 | 6 | Idempotency | An `Idempotency-Key` isn't bound to the request body: reusing a key with a different `ttl_s` silently returns the original | The caller gets a sandbox it didn't ask for | Store a body hash with the key and return 422 on mismatch |
@@ -139,18 +143,55 @@ most severe first:
 | 11 | Secrets | `database_url` is a plain `str` (use `SecretStr` so repr and tracebacks can't leak it). Defaults embed `app:app` credentials, so prod with a missing env var silently targets localhost. `REDIS_URL` is a plain Terraform env var, so an AUTH password would end up in TF state. `/metrics` is served on the public API port | Credential leakage, exposure of internals | No DSN defaults outside local. `REDIS_URL` in Secret Manager like `DATABASE_URL`. Metrics on an internal port. (Compose publishes Postgres and Redis without auth and gives Grafana anonymous Admin: local-only shortcut) |
 
 ## What I'd do next
-1. Metric-driven cutover (PLAN step 4): a rollout loop that steps the canary weight 10→25→50→100 on healthy canary metrics and sets it to 0 on a breach. The rollback also moves queued canary jobs to stable (today that's a manual runbook command).
-2. Authn and tenant scoping (limitation #1), including `PUT /rollout`: the only open item that exposes data.
-3. Real isolation: gVisor (`runsc`) or Firecracker microVMs, behind a small runtime API so the worker loses the Docker socket.
-4. Egress policy for the sandbox network (deny by default) plus per-sandbox auth on the URL.
-5. Stuck-sandbox sweep (#2) folded into the reaper. Detection and alerts exist since Slice 3; the automatic fix-up doesn't yet.
-6. Redis read timeouts (#3) and a hard admission cap (Postgres advisory lock or a Redis semaphore) instead of count-then-insert (#4).
+Most important first. Item 1 finishes the brief. Items 2–4 block real traffic.
+1. **Metric-driven cutover (step 5).** A controller that steps the weight 10→25→50→100 when the canary has ≥ N starts,
+   a success ratio ≥ stable and p95 time-to-running ≤ 1.2× stable, and sets it to 0 on a breach. No data means hold
+   (never promote on silence), and a dead controller leaves the weight where it is. Rollback moves queued canary
+   jobs back to stable. The per-pool signals and the "Rollout (A/B)" dashboard row already exist; add a
+   stale-rollout alert.
+2. **Authn and tenant scoping** (limitation #1), including `PUT /rollout`. This is the only open item that exposes data.
+3. **Stuck-sandbox sweep** (#2). Alerts fire today, but a stuck row holds an admission slot forever, so enough of them
+   and every `POST` gets 429.
+4. **Real isolation.** Use gVisor or Firecracker behind a small runtime API so the worker no longer holds the Docker
+   socket. Deny egress by default and put auth on each sandbox URL.
+5. **Bounded dependencies:** a Redis pool with `socket_timeout` for the worker's poll (#3; `/metrics` is already
+   bounded) and an atomic admission cap (#4).
+6. **SLO hygiene:** burn-rate alerts for the sandbox SLOs and a `10`s histogram bucket (see [SLO known gaps](docs/SLO.md#known-gaps)).
 7. Alembic migrations instead of `create_all`.
 
 ## Time log
-- **Plan** — `PLAN.md`: thinnest end-to-end slice first, then containers → observability → A/B → metric cutover.
-- **Slice 1 (step 1)** — replaced placeholder `items` with `sandboxes`: `POST/GET /sandboxes`, `start_sandbox` job, worker logs the work and marks `running`; producer metric; tests, smoke, k6 updated.
+Task received 16:58. Write-up at 18:02, about 65 min in. Times come from commits. The scaffold (16:00–16:28) was done
+before the window.
+
+| Time | Step | Result |
+|---|---|---|
+| 16:58–17:05 | Plan | `PLAN.md` |
+| 17:05–17:19 | Slice 1: step 1 queue | on `main` |
+| 17:19–17:41 | Slice 2: step 2 container per job | on `main` |
+| 17:29–17:34 | SRE review (parallel worktree) | merged 17:58 |
+| 17:41–17:56 | Slice 3: step 3 metrics, dashboard, alerts | on `main` |
+| 17:45–17:59 | Slice 4: step 4 A/B (parallel worktree) | merged after the write-up (below) |
+| — | Step 5 metric cutover | **cut** (not started) |
+| 17:59–18:04 | README, SLO, runbook | on `main` |
+| 18:04–18:20 | Merge Slice 4 into `main` (past the window) | on `main`, `make lint test smoke` green |
+
+**What I cut, and why:**
+- **Step 5 (automated cutover).** It depends on step 4, and there wasn't time for both. The design (gates,
+  hold-on-no-data, fail-static weight, rollback drain) is in `PLAN.md` and What I'd do next #1.
+- **Isolation, auth, multi-host, sandboxes on Cloud Run:** out of scope on purpose (`PLAN.md` "Deliberately not doing").
+  Each is labelled **SHORTCUT** or listed under Known limitations.
+- **Migrations and sandbox burn-rate alerts:** swapped for `create_all` and threshold alerts (see Decisions).
+
+**Slice notes:**
+- **Plan**: `PLAN.md`. Thinnest end-to-end slice first, then containers → observability → A/B → metric cutover.
+- **Slice 1 (step 1)**: replaced placeholder `items` with `sandboxes`: `POST/GET /sandboxes`, `start_sandbox` job, worker logs the work and marks `running`; producer metric; tests, smoke, k6 updated.
 - **Slice 2 (step 2)**: the worker launches one hardened `traefik/whoami` container per job on an isolated network, probes readiness and records/logs the URL. Added `DELETE`, TTL, admission cap, and a reaper reconcile loop with 2 new alerts and runbook entries. Verified live: URL serves, stop removes it, TTL expiry and orphan cleanup work, sandbox can't reach Postgres/Redis.
 - **Slice 3 (step 3)**: lifecycle metrics (freshness SLI, queue wait, per-status counts and ages, capacity, per-queue depth), a rebuilt dashboard (overview row + lifecycle / queue & producer / API / logs), 4 new alerts replacing the depth alert that could no longer fire, and SLO + runbook entries. Found and fixed the `job` label collision by running every panel query against live Prometheus. Verified an alert fires with the worker stopped.
 - **SRE review** (parallel worktree, branch `sre-review-fixes`): fixed launches stuck in `starting` (own launch timeout plus SIGTERM drain), `POST` idempotency (`Idempotency-Key`), and HTTP method label cardinality. The other findings are listed under Known limitations. Merged after Slice 2: the capacity check now lets keyed retries through, and `JOB_TIMEOUT_S` went to 90s so launch + container cleanup + DB writes fit inside it.
 - **Slice 4 (A/B, PLAN step 3)**: two worker pools (`worker-a` stable, `worker-b` canary) on separate queues. The producer routes each job with `crc32(id) % 100 < canary_weight`; the weight lives in Redis, is set via `GET/PUT /rollout` (`make rollout W=25`), and falls back to stable if Redis can't be read. Every job metric carries a `deployment` label, plus `worker_info` and a `rollout_canary_weight` gauge; `/metrics` Redis sampling now has a timeout. New alert `QueueNotDraining` with a runbook entry. `make chaos` now targets the canary. Smoke runs the full lifecycle on each pool.
+- **Slice 4 merge** (after the window): the branch forked before Slice 3, so it conflicted in 11 files. Resolved on
+  Slice 3's side where they overlapped: metric label `task` (not `job`) plus slice 4's `deployment` label, which
+  time-to-running and queue wait now carry too (a cutover compares pools on exactly those); per-pool due-job
+  `queue_depth` replaces the per-queue gauge; `QueueNotDraining` kept, `QueueBacklogGrowing` stays removed;
+  `Idempotency-Key` replay carries the pool; the dashboard gained a "Rollout (A/B)" row. 85 tests; smoke runs the
+  lifecycle on both pools.
