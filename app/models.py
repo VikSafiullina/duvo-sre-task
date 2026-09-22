@@ -27,8 +27,15 @@ class SandboxStatus(enum.StrEnum):
     QUEUED = "queued"
     STARTING = "starting"
     RUNNING = "running"
+    STOPPING = "stopping"
     STOPPED = "stopped"
     FAILED = "failed"
+
+
+# Statuses that hold (or are about to hold) a container: they count against the cap.
+ACTIVE_STATUSES = frozenset(
+    {SandboxStatus.QUEUED, SandboxStatus.STARTING, SandboxStatus.RUNNING, SandboxStatus.STOPPING}
+)
 
 
 class Sandbox(Base):
@@ -42,11 +49,10 @@ class Sandbox(Base):
     status: Mapped[SandboxStatus] = mapped_column(
         _str_enum(SandboxStatus), default=SandboxStatus.QUEUED
     )
-    # Filled once a container serves traffic (next increment). Declared now because
-    # create_all never alters an existing table.
-    url: Mapped[str | None] = mapped_column(String(200))
+    url: Mapped[str | None] = mapped_column(String(200))  # set once the server answers
     error: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(default=0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # TTL from creation
     # Client-supplied Idempotency-Key: a retried POST gets the original sandbox back instead
     # of a second one. Unique, so concurrent retries race safely on the database.
     idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)

@@ -73,6 +73,28 @@ groups:
           description: "Queue depth is {{ $value }}."
           runbook: docs/RUNBOOK.md#queuebackloggrowing
 
+  - name: duvo-sandboxes
+    rules:
+      - alert: SandboxLeaked
+        expr: sum(increase(sandboxes_reaped_total{reason=~"orphan|vanished"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: Sandbox containers drifted out of sync with the database
+          description: "{{ $value }} orphaned/vanished sandboxes reaped in 15m (crash or external kill)."
+          runbook: docs/RUNBOOK.md#sandboxleaked
+
+      # Paging: with the reaper down, TTLs aren't enforced and the host fills up. The cap then
+      # answers 429, which the 5xx SLO alerts never see.
+      - alert: SandboxReaperFailing
+        expr: sum(increase(sandbox_reconcile_runs_total{outcome="failed"}[10m])) >= 3
+        labels:
+          severity: page
+        annotations:
+          summary: Sandbox reaper keeps failing; TTLs and leak cleanup are not enforced
+          description: "{{ $value }} failed reaper sweeps in 10m."
+          runbook: docs/RUNBOOK.md#sandboxreaperfailing
+
   - name: duvo-targets
     rules:
       - alert: TargetDown

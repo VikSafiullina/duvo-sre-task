@@ -40,4 +40,22 @@ Look for one route/error class dominating; open a ticket, fix in normal hours.
 
 **Mitigate:** restart · roll back · fix config.
 
-<!-- TASK: add entries for any new alerts/failure modes. -->
+## SandboxLeaked
+**Meaning:** the reaper removed containers with no live DB row (`orphan`: worker crashed between
+`docker run` and the status write, or a stop was lost) or failed rows whose container vanished
+(`vanished`: OOM-kill, manual `docker rm`, daemon restart). Already cleaned up; this is a signal.
+1. Logs: `{service_name="duvo-worker"} |= "sandbox reaped"` → which `reason`, which ids?
+2. `vanished` in bulk → `docker events --filter label=duvo.sandbox.id` / host memory (OOM).
+3. `orphan` in bulk → worker restarts (`make ps`, TargetDown) around the same time.
+
+**Mitigate:** raise `SANDBOX_MEMORY` if OOM · fix the crash loop · nothing to clean by hand.
+
+## SandboxReaperFailing
+**Meaning:** reconcile sweeps error out, so TTLs, leak cleanup and lost stops aren't handled.
+Containers pile up until the cap (`SANDBOX_MAX_ACTIVE`) answers 429 to everyone.
+1. Logs: `{service_name="duvo-worker"} |= "reconcile failed"`. The `exc` field has the cause.
+2. Docker daemon reachable from the worker? `docker compose exec worker python -c "import docker; docker.from_env().ping()"`.
+3. `make sandboxes`: how many are running and how old are they?
+
+**Mitigate:** restore Docker/DB access · manual cleanup: `docker rm -f $(docker ps -q --filter label=duvo.sandbox.id)`
+(rows are corrected on the next successful sweep).

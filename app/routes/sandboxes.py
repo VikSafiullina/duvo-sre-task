@@ -1,26 +1,59 @@
-"""Sandbox lifecycle API: the producer side of the queue."""
+"""Sandbox lifecycle API: the producer side of the queue. The API never talks to Docker —
+it records intent in Postgres and hands the work to the worker."""
 
 import logging
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import QueueDep, SessionDep, SettingsDep
 from app.metrics import JOBS_ENQUEUED
-from app.models import Sandbox, SandboxStatus
-from app.queue import START_SANDBOX, enqueue_start_sandbox, start_sandbox_job_id
+from app.models import ACTIVE_STATUSES, Sandbox, SandboxStatus
+from app.queue import START_SANDBOX, STOP_SANDBOX, enqueue_sandbox_job, sandbox_job_id
 from app.schemas import SandboxAccepted, SandboxCreate, SandboxOut
 
 router = APIRouter(prefix="/sandboxes", tags=["sandboxes"])
 log = logging.getLogger("app.sandboxes")
 
+_503 = HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "queue unavailable, retry later")
+
+
+async def _get_or_404(session: AsyncSession, sandbox_id: uuid.UUID) -> Sandbox:
+    sandbox = await session.get(Sandbox, sandbox_id)
+    if sandbox is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "sandbox not found")
+    return sandbox
+
 
 IdempotencyKey = Annotated[
     str | None, Header(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
 ]
+
+
+def _accepted(sandbox: Sandbox) -> SandboxAccepted:
+    return SandboxAccepted(
+        job_id=sandbox_job_id(START_SANDBOX, sandbox.id),
+        sandbox_id=sandbox.id,
+        type=sandbox.type,
+        status=sandbox.status,
+        expires_at=sandbox.expires_at,
+    )
+
+
+async def _replay(session: AsyncSession, key: str, response: Response) -> SandboxAccepted | None:
+    """The sandbox an earlier request with this Idempotency-Key created, if any."""
+    original = await session.scalar(select(Sandbox).where(Sandbox.idempotency_key == key))
+    if original is None:
+        return None
+    JOBS_ENQUEUED.labels(START_SANDBOX, "deduplicated").inc()
+    log.info("idempotent replay", extra={"sandbox_id": str(original.id)})
+    response.headers["Idempotent-Replayed"] = "true"
+    return _accepted(original)
 
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=SandboxAccepted)
@@ -37,50 +70,51 @@ async def create_sandbox(
     the caller gets a 503 to retry.
 
     With an `Idempotency-Key`, a retry (client timeout, 503, concurrent duplicate) returns the
-    original sandbox instead of starting another container. The unique constraint picks the
-    winner, so there is no check-then-insert race. A replayed `failed` sandbox stays failed:
-    use a new key to try again."""
-    sandbox = Sandbox(type=body.type, status=SandboxStatus.QUEUED, idempotency_key=idempotency_key)
+    original sandbox instead of starting another container, even at capacity (the original
+    already holds its slot). The unique constraint settles concurrent duplicates. A replayed
+    `failed` sandbox stays failed: use a new key to try again."""
+    if idempotency_key and (replay := await _replay(session, idempotency_key, response)):
+        return replay
+    active = await session.scalar(
+        select(func.count()).select_from(Sandbox).where(Sandbox.status.in_(ACTIVE_STATUSES))
+    )
+    if (active or 0) >= settings.sandbox_max_active:
+        log.warning("sandbox cap reached", extra={"active": active})
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"sandbox capacity reached ({settings.sandbox_max_active}), retry later",
+            headers={"Retry-After": "30"},
+        )
+    expires_at = datetime.now(UTC) + timedelta(seconds=body.ttl_s)
+    sandbox = Sandbox(
+        type=body.type,
+        status=SandboxStatus.QUEUED,
+        expires_at=expires_at,
+        idempotency_key=idempotency_key,
+    )
     session.add(sandbox)
     try:
         await session.commit()
     except IntegrityError:
-        await session.rollback()
-        if idempotency_key is None:
-            raise
-        original = await session.scalar(
-            select(Sandbox).where(Sandbox.idempotency_key == idempotency_key)
-        )
-        if original is None:
-            raise
-        JOBS_ENQUEUED.labels(START_SANDBOX, "deduplicated").inc()
-        log.info("idempotent replay", extra={"sandbox_id": str(original.id)})
-        response.headers["Idempotent-Replayed"] = "true"
-        return SandboxAccepted(
-            job_id=start_sandbox_job_id(original.id),
-            sandbox_id=original.id,
-            type=original.type,
-            status=original.status,
-        )
-    job_id = start_sandbox_job_id(sandbox.id)
+        await session.rollback()  # a concurrent request with the same key won the insert
+        if idempotency_key and (replay := await _replay(session, idempotency_key, response)):
+            return replay
+        raise
+    job_id = sandbox_job_id(START_SANDBOX, sandbox.id)
     try:
-        await enqueue_start_sandbox(queue, sandbox.id, settings.redis_timeout_s)
+        await enqueue_sandbox_job(queue, START_SANDBOX, sandbox.id, settings.redis_timeout_s)
     except Exception as exc:
         JOBS_ENQUEUED.labels(START_SANDBOX, "error").inc()
         log.exception("enqueue failed", extra={"sandbox_id": str(sandbox.id), "job_id": job_id})
         sandbox.status, sandbox.error = SandboxStatus.FAILED, f"enqueue: {type(exc).__name__}"
         await session.commit()
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "queue unavailable, retry later"
-        ) from None
+        raise _503 from None
     JOBS_ENQUEUED.labels(START_SANDBOX, "enqueued").inc()
     log.info(
         "sandbox requested",
         extra={"sandbox_id": str(sandbox.id), "job_id": job_id, "type": sandbox.type},
     )
-    return SandboxAccepted(
-        job_id=job_id, sandbox_id=sandbox.id, type=sandbox.type, status=sandbox.status
-    )
+    return _accepted(sandbox)
 
 
 @router.get("", response_model=list[SandboxOut])
@@ -93,7 +127,36 @@ async def list_sandboxes(
 
 @router.get("/{sandbox_id}", response_model=SandboxOut)
 async def get_sandbox(sandbox_id: uuid.UUID, session: SessionDep) -> Sandbox:
-    sandbox = await session.get(Sandbox, sandbox_id)
-    if sandbox is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "sandbox not found")
+    return await _get_or_404(session, sandbox_id)
+
+
+@router.delete("/{sandbox_id}", status_code=status.HTTP_202_ACCEPTED, response_model=SandboxOut)
+async def stop_sandbox(
+    sandbox_id: uuid.UUID, session: SessionDep, queue: QueueDep, settings: SettingsDep
+) -> Sandbox:
+    """Idempotent. Stopped/failed sandboxes come back unchanged. Otherwise the row moves to
+    `stopping` (compare-and-set, so it can't clobber a concurrent worker transition) and the
+    worker removes the container. If enqueueing fails the row stays `stopping`: the reaper
+    finishes the stop within one sweep, and a retried DELETE re-enqueues the fast path."""
+    sandbox = await _get_or_404(session, sandbox_id)
+    if sandbox.status not in ACTIVE_STATUSES:
+        return sandbox
+    await session.execute(
+        update(Sandbox)
+        .where(Sandbox.id == sandbox_id, Sandbox.status.in_(ACTIVE_STATUSES))
+        .values(status=SandboxStatus.STOPPING)
+    )
+    await session.commit()
+    await session.refresh(sandbox)
+    if sandbox.status != SandboxStatus.STOPPING:
+        return sandbox  # settled some other way in between
+    job_id = sandbox_job_id(STOP_SANDBOX, sandbox.id)
+    try:
+        await enqueue_sandbox_job(queue, STOP_SANDBOX, sandbox.id, settings.redis_timeout_s)
+    except Exception:
+        JOBS_ENQUEUED.labels(STOP_SANDBOX, "error").inc()
+        log.exception("enqueue failed", extra={"sandbox_id": str(sandbox.id), "job_id": job_id})
+        raise _503 from None
+    JOBS_ENQUEUED.labels(STOP_SANDBOX, "enqueued").inc()
+    log.info("sandbox stop requested", extra={"sandbox_id": str(sandbox.id), "job_id": job_id})
     return sandbox
