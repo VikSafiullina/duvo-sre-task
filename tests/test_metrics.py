@@ -4,9 +4,9 @@ from fastapi.testclient import TestClient
 
 
 def test_metrics_label_by_route_template(client: TestClient) -> None:
-    client.get(f"/items/{uuid.uuid4()}")
+    client.get(f"/sandboxes/{uuid.uuid4()}")
     body = client.get("/metrics").text
-    assert 'http_requests_total{method="GET",route="/items/{item_id}",status="404"}' in body
+    assert 'http_requests_total{method="GET",route="/sandboxes/{sandbox_id}",status="404"}' in body
     assert "queue_depth" in body
 
 

@@ -10,7 +10,7 @@ async def reset_state(settings: Settings) -> None:
     engine = make_engine(settings)
     await create_schema(engine)
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE items"))
+        await conn.execute(text("TRUNCATE sandboxes"))
     await engine.dispose()
     redis = Redis.from_url(settings.redis_url)
     await redis.flushdb()

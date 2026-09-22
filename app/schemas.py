@@ -1,28 +1,32 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
-from app.models import ItemStatus
-
-
-class ItemCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+from app.models import SandboxStatus, SandboxType
 
 
-class ItemOut(BaseModel):
+class SandboxCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # a typo'd field is a 422, not silently ignored
+
+    type: SandboxType
+
+
+class SandboxOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    name: str
-    status: ItemStatus
-    result: str | None
+    type: SandboxType
+    status: SandboxStatus
+    url: str | None
+    error: str | None
     attempts: int
     created_at: datetime
     updated_at: datetime
 
 
-class JobAccepted(BaseModel):
+class SandboxAccepted(BaseModel):
     job_id: str
-    item_id: uuid.UUID
-    status: ItemStatus
+    sandbox_id: uuid.UUID
+    type: SandboxType
+    status: SandboxStatus

@@ -10,35 +10,42 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _str_enum(cls: type[enum.StrEnum]) -> Enum:
+    """Store enums as plain VARCHAR values: adding a member needs no DB migration."""
+    return Enum(cls, native_enum=False, length=20, values_callable=lambda e: [m.value for m in e])
+
+
 class Base(DeclarativeBase):
     pass
 
 
-class ItemStatus(enum.StrEnum):
-    PENDING = "pending"
+class SandboxType(enum.StrEnum):
+    HTTP = "http"
+
+
+class SandboxStatus(enum.StrEnum):
     QUEUED = "queued"
-    PROCESSING = "processing"
-    DONE = "done"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPED = "stopped"
     FAILED = "failed"
 
 
-class Item(Base):
-    """Placeholder domain object — rename or replace it for the real task."""
+class Sandbox(Base):
+    """An isolated environment an AI agent runs in. Postgres is the source of truth for its
+    lifecycle; the queue only carries "go do this" messages."""
 
-    __tablename__ = "items"
+    __tablename__ = "sandboxes"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    name: Mapped[str] = mapped_column(String(200))
-    status: Mapped[ItemStatus] = mapped_column(
-        Enum(
-            ItemStatus,
-            native_enum=False,
-            length=20,
-            values_callable=lambda e: [m.value for m in e],
-        ),
-        default=ItemStatus.PENDING,
+    type: Mapped[SandboxType] = mapped_column(_str_enum(SandboxType))
+    status: Mapped[SandboxStatus] = mapped_column(
+        _str_enum(SandboxStatus), default=SandboxStatus.QUEUED
     )
-    result: Mapped[str | None] = mapped_column(Text)
+    # Filled once a container serves traffic (next increment). Declared now because
+    # create_all never alters an existing table.
+    url: Mapped[str | None] = mapped_column(String(200))
+    error: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(

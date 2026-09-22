@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     job_max_tries: int = 3
     job_timeout_s: int = 60
     worker_metrics_port: int = 9100
-    chaos_failure_rate: float = 0.0  # 0..1 — makes the example job fail on purpose
+    chaos_failure_rate: float = 0.0  # 0..1 — makes sandbox starts fail on purpose
 
 
 @lru_cache

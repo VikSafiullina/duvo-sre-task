@@ -1,5 +1,6 @@
 """Queue plumbing shared by the API (producer) and the worker (consumer)."""
 
+import asyncio
 import uuid
 
 from arq.connections import ArqRedis, RedisSettings
@@ -8,23 +9,26 @@ from opentelemetry import propagate
 
 from app.config import Settings
 
-PROCESS_ITEM = "process_item"
+START_SANDBOX = "start_sandbox"
 
 
 def redis_settings(settings: Settings) -> RedisSettings:
     return RedisSettings.from_dsn(settings.redis_url)
 
 
-def process_item_job_id(item_id: uuid.UUID) -> str:
-    return f"{PROCESS_ITEM}:{item_id}"
+def start_sandbox_job_id(sandbox_id: uuid.UUID) -> str:
+    return f"{START_SANDBOX}:{sandbox_id}"
 
 
-async def enqueue_process_item(queue: ArqRedis, item_id: uuid.UUID) -> Job | None:
-    """Deterministic job id => a duplicate request while the job is queued or running is a
+async def enqueue_start_sandbox(
+    queue: ArqRedis, sandbox_id: uuid.UUID, timeout_s: float
+) -> Job | None:
+    """Deterministic job id => a duplicate enqueue while the job is queued or running is a
     no-op (arq returns None). Trace context rides in the job args so the worker span joins
-    the API request's trace."""
+    the API request's trace. arq only sets a *connect* timeout, so we bound the call here."""
     carrier: dict[str, str] = {}
     propagate.inject(carrier)
-    return await queue.enqueue_job(
-        PROCESS_ITEM, str(item_id), carrier, _job_id=process_item_job_id(item_id)
-    )
+    async with asyncio.timeout(timeout_s):
+        return await queue.enqueue_job(
+            START_SANDBOX, str(sandbox_id), carrier, _job_id=start_sandbox_job_id(sandbox_id)
+        )

@@ -17,11 +17,10 @@ export const options = {
 };
 
 export default function () {
-  const created = http.post(`${BASE}/items`, JSON.stringify({ name: `load-${__VU}-${__ITER}` }), JSON_HEADERS);
-  check(created, { 'create 201': (r) => r.status === 201 });
-  const id = created.json('id');
-  check(http.get(`${BASE}/items/${id}`), { 'get 200': (r) => r.status === 200 });
-  check(http.post(`${BASE}/items/${id}/process`), { 'process 202': (r) => r.status === 202 });
-  check(http.get(`${BASE}/items?limit=20`), { 'list 200': (r) => r.status === 200 });
+  const created = http.post(`${BASE}/sandboxes`, JSON.stringify({ type: 'http' }), JSON_HEADERS);
+  check(created, { 'create 202': (r) => r.status === 202 });
+  const id = created.json('sandbox_id');
+  check(http.get(`${BASE}/sandboxes/${id}`), { 'get 200': (r) => r.status === 200 });
+  check(http.get(`${BASE}/sandboxes?limit=20`), { 'list 200': (r) => r.status === 200 });
   sleep(0.5);
 }

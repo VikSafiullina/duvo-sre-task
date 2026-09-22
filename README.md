@@ -26,19 +26,22 @@ make down
 
 ## Architecture
 ```
-client ──HTTP──▶ api (FastAPI) ──▶ Postgres
-                    │  enqueue (job id = idempotency key, trace context in args)
+client ──POST /sandboxes {"type":"http"}──▶ api (producer) ──▶ Postgres (sandbox row = source of truth)
+                    │  enqueue start_sandbox:{id} (deterministic id, trace context in args)
                     ▼
-                 Redis (arq queue) ──▶ worker ──▶ Postgres
+                 Redis (arq queue) ──▶ worker (consumer) ──▶ Postgres  queued → starting → running | failed
 api + worker ──OTLP (traces, logs)──▶ OTel Collector ─▶ Tempo / Loki ─▶ Grafana
 Prometheus ──scrape /metrics──▶ api :8000, worker :9100   (SLO burn-rate alerts)
 ```
-<!-- TASK: update for the real domain. -->
 
 ## Decisions & trade-offs
 | Decision | Why | Trade-off / revisit when |
 |---|---|---|
-| <!-- TASK --> | | |
+| Sandbox row written *before* enqueue; enqueue failure marks it `failed` + 503 | Worker always finds its row; no sandbox is left looking `queued` forever | Caller retry creates a new sandbox — an `Idempotency-Key` header would fix that |
+| `asyncio.timeout` around enqueue | arq sets only a *connect* timeout; a hung Redis would otherwise hang the request | No retry on enqueue: fail fast, caller retries |
+| Worker skips sandboxes not in `queued`/`starting` | Queue delivery is at-least-once; a redelivered job must not start a sandbox twice | Relies on the DB row, not on arq's result store (`keep_result=0`) |
+| `jobs_enqueued_total{outcome}` on the producer | Producer health visible separately from HTTP 5xx | 503s also burn the API SLO; no separate alert yet |
+| `url`/`error` columns added in slice 1 | `create_all` never alters existing tables | Real migrations (Alembic) before production |
 | Liveness (`/healthz`) ≠ readiness (`/readyz`) | A DB blip must not trigger a restart storm | — |
 | Deterministic job ids | Duplicate requests don't double-process while a job is queued/running | Window ends when the job finishes; true exactly-once needs DB-level guards |
 | Write status *before* enqueue, roll back on failure | A fast worker can't be overwritten by a late API write | Brief "queued" state if the process dies between the two steps |
@@ -65,4 +68,5 @@ Not provisioned here (next steps): Cloud SQL, Memorystore, Serverless VPC access
 <!-- TASK: prioritized list, most important first. -->
 
 ## Time log
-<!-- TASK: what got done in the hour, what I cut and why. -->
+- **Plan** — `PLAN.md`: thinnest end-to-end slice first, then containers → observability → A/B → metric cutover.
+- **Slice 1 (step 1)** — replaced placeholder `items` with `sandboxes`: `POST/GET /sandboxes`, `start_sandbox` job, worker logs the work and marks `running`; producer metric; tests, smoke, k6 updated.
