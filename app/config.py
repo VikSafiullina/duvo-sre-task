@@ -24,6 +24,19 @@ class Settings(BaseSettings):
     worker_metrics_port: int = 9100
     chaos_failure_rate: float = 0.0  # 0..1 — makes sandbox starts fail on purpose
 
+    # Sandbox runtime (the worker talks to the local Docker daemon)
+    docker_timeout_s: float = 10.0  # per Docker API call
+    sandbox_image: str = "traefik/whoami:v1.11"  # pinned: a moving tag would change under us
+    sandbox_port: int = 8080
+    sandbox_network: str = "duvo-sandboxes"  # isolated from Postgres/Redis on purpose
+    sandbox_public_host: str = "localhost"  # host part of the URL handed back to callers
+    sandbox_memory: str = "64m"
+    sandbox_cpus: float = 0.25
+    sandbox_pids: int = 64
+    sandbox_ready_timeout_s: float = 15.0  # container started != server answering
+    sandbox_max_active: int = 50  # admission control: protects the host from bursts
+    reconcile_interval_s: int = 30  # TTL reaper / orphan sweep cadence
+
 
 @lru_cache
 def get_settings() -> Settings:

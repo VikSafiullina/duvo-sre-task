@@ -1,5 +1,6 @@
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -8,98 +9,194 @@ from arq import Retry
 from app.config import Settings
 from app.db import make_engine, make_sessionmaker
 from app.models import Sandbox, SandboxStatus, SandboxType
-from app.worker import start_sandbox
-from tests.support import reset_state
+from app.runtime import SandboxNotReady
+from app.worker import reconcile_sandboxes, start_sandbox, stop_sandbox
+from tests.support import FakeRuntime, reset_state
+
+S = SandboxStatus
 
 
 @pytest.fixture
 async def ctx(settings: Settings) -> AsyncIterator[dict[str, Any]]:
     await reset_state(settings)
     engine = make_engine(settings)
-    yield {"settings": settings, "sessionmaker": make_sessionmaker(engine), "job_try": 1}
+    yield {
+        "settings": settings,
+        "sessionmaker": make_sessionmaker(engine),
+        "runtime": FakeRuntime(),
+        "job_try": 1,
+    }
     await engine.dispose()
 
 
-async def _add_sandbox(ctx: dict[str, Any], status: SandboxStatus = SandboxStatus.QUEUED) -> str:
+def _in(seconds: int) -> datetime:
+    return datetime.now(UTC) + timedelta(seconds=seconds)
+
+
+async def _add(ctx: dict[str, Any], status: S = S.QUEUED, ttl_s: int = 600) -> uuid.UUID:
     async with ctx["sessionmaker"]() as s:
-        sandbox = Sandbox(type=SandboxType.HTTP, status=status)
+        sandbox = Sandbox(type=SandboxType.HTTP, status=status, expires_at=_in(ttl_s))
         s.add(sandbox)
         await s.commit()
-        return str(sandbox.id)
+        return sandbox.id
 
 
-async def _get(ctx: dict[str, Any], sandbox_id: str) -> Sandbox:
+async def _get(ctx: dict[str, Any], sandbox_id: uuid.UUID) -> Sandbox:
     async with ctx["sessionmaker"]() as s:
-        sandbox = await s.get(Sandbox, uuid.UUID(sandbox_id))
+        sandbox = await s.get(Sandbox, sandbox_id)
         assert sandbox is not None
         return sandbox
 
 
-def _always_fail(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
-    async def broken(sandbox: Sandbox, failure_rate: float) -> str:
-        raise exc
-
-    monkeypatch.setattr("app.worker._launch", broken)
-
-
-async def test_job_marks_sandbox_running(ctx: dict[str, Any]) -> None:
-    sandbox_id = await _add_sandbox(ctx)
-    assert await start_sandbox(ctx, sandbox_id, {}) == "running"
-    sandbox = await _get(ctx, sandbox_id)
-    assert (sandbox.status, sandbox.attempts, sandbox.error) == (SandboxStatus.RUNNING, 1, None)
+async def _set_status(ctx: dict[str, Any], sandbox_id: uuid.UUID, status: S) -> None:
+    async with ctx["sessionmaker"]() as s:
+        sandbox = await s.get(Sandbox, sandbox_id)
+        assert sandbox is not None
+        sandbox.status = status
+        await s.commit()
 
 
-async def test_job_retries_then_fails_permanently(ctx: dict[str, Any]) -> None:
+# --- start_sandbox ---------------------------------------------------------------------
+
+
+async def test_start_launches_container_and_records_url(ctx: dict[str, Any]) -> None:
+    sid = await _add(ctx)
+    assert await start_sandbox(ctx, str(sid), {}) == "running"
+    sandbox = await _get(ctx, sid)
+    assert (sandbox.status, sandbox.url, sandbox.attempts, sandbox.error) == (
+        S.RUNNING,
+        "http://localhost:49153",
+        1,
+        None,
+    )
+    assert sid in ctx["runtime"].containers
+
+
+async def test_start_retries_then_fails_permanently(ctx: dict[str, Any]) -> None:
     ctx["settings"] = ctx["settings"].model_copy(update={"chaos_failure_rate": 1.0})
-    sandbox_id = await _add_sandbox(ctx)
+    sid = await _add(ctx)
     with pytest.raises(Retry):
-        await start_sandbox(ctx, sandbox_id, {})
-    sandbox = await _get(ctx, sandbox_id)
-    assert sandbox.status == SandboxStatus.QUEUED
-    assert sandbox.error == "ChaosError: injected failure"  # why it is retrying is visible
+        await start_sandbox(ctx, str(sid), {})
+    sandbox = await _get(ctx, sid)
+    assert (sandbox.status, sandbox.error) == (S.QUEUED, "ChaosError: injected failure")
     ctx["job_try"] = ctx["settings"].job_max_tries
-    assert await start_sandbox(ctx, sandbox_id, {}) == "failed"
-    assert (await _get(ctx, sandbox_id)).status == SandboxStatus.FAILED
+    assert await start_sandbox(ctx, str(sid), {}) == "failed"
+    assert (await _get(ctx, sid)).status == S.FAILED
 
 
-async def test_unexpected_error_retries_then_fails_visibly(
-    ctx: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A real bug in the launch (not the injected chaos) must never leave a sandbox stuck."""
-    _always_fail(monkeypatch, RuntimeError("docker exploded"))
-    sandbox_id = await _add_sandbox(ctx)
+async def test_failed_launch_discards_container_before_retry(ctx: dict[str, Any]) -> None:
+    """A half-started container must not survive into the retry (or leak on final failure)."""
+    sid = await _add(ctx)
+    ctx["runtime"].containers[sid] = _in(600)  # what the failed attempt left behind
+    ctx["runtime"].launch_error = SandboxNotReady("no answer within 15s")
     with pytest.raises(Retry):
-        await start_sandbox(ctx, sandbox_id, {})
-    assert (await _get(ctx, sandbox_id)).status == SandboxStatus.QUEUED
+        await start_sandbox(ctx, str(sid), {})
+    assert ctx["runtime"].containers == {}
     ctx["job_try"] = ctx["settings"].job_max_tries
-    assert await start_sandbox(ctx, sandbox_id, {}) == "failed"
-    sandbox = await _get(ctx, sandbox_id)
-    assert sandbox.status == SandboxStatus.FAILED
-    assert sandbox.error == "RuntimeError: docker exploded"
+    assert await start_sandbox(ctx, str(sid), {}) == "failed"
+    assert (await _get(ctx, sid)).error == "SandboxNotReady: no answer within 15s"
 
 
 async def test_success_after_retry_clears_error(ctx: dict[str, Any]) -> None:
-    ctx["settings"] = ctx["settings"].model_copy(update={"chaos_failure_rate": 1.0})
-    sandbox_id = await _add_sandbox(ctx)
+    sid = await _add(ctx)
+    ctx["runtime"].launch_error = SandboxNotReady("slow")
     with pytest.raises(Retry):
-        await start_sandbox(ctx, sandbox_id, {})
-    ctx["settings"] = ctx["settings"].model_copy(update={"chaos_failure_rate": 0.0})
-    ctx["job_try"] = 2
-    assert await start_sandbox(ctx, sandbox_id, {}) == "running"
-    sandbox = await _get(ctx, sandbox_id)
-    assert (sandbox.status, sandbox.attempts, sandbox.error) == (SandboxStatus.RUNNING, 2, None)
+        await start_sandbox(ctx, str(sid), {})
+    ctx["runtime"].launch_error, ctx["job_try"] = None, 2
+    assert await start_sandbox(ctx, str(sid), {}) == "running"
+    sandbox = await _get(ctx, sid)
+    assert (sandbox.status, sandbox.attempts, sandbox.error) == (S.RUNNING, 2, None)
 
 
-@pytest.mark.parametrize("status", [SandboxStatus.RUNNING, SandboxStatus.FAILED])
-async def test_redelivery_of_settled_sandbox_is_noop(
-    ctx: dict[str, Any], monkeypatch: pytest.MonkeyPatch, status: SandboxStatus
-) -> None:
+@pytest.mark.parametrize("status", [S.RUNNING, S.STOPPING, S.STOPPED, S.FAILED])
+async def test_redelivery_of_settled_sandbox_is_noop(ctx: dict[str, Any], status: S) -> None:
     """At-least-once delivery: a repeat job must not launch the sandbox a second time."""
-    _always_fail(monkeypatch, AssertionError("launch must not be called"))
-    sandbox_id = await _add_sandbox(ctx, status)
-    assert await start_sandbox(ctx, sandbox_id, {}) == status.value
-    assert (await _get(ctx, sandbox_id)).attempts == 0
+    sid = await _add(ctx, status)
+    assert await start_sandbox(ctx, str(sid), {}) == status.value
+    assert ctx["runtime"].containers == {}
+    assert (await _get(ctx, sid)).attempts == 0
 
 
-async def test_job_for_missing_sandbox_is_noop(ctx: dict[str, Any]) -> None:
+async def test_sandbox_expired_in_queue_is_not_started(ctx: dict[str, Any]) -> None:
+    sid = await _add(ctx, ttl_s=-1)
+    assert await start_sandbox(ctx, str(sid), {}) == "expired"
+    assert (await _get(ctx, sid)).status == S.STOPPED
+    assert ctx["runtime"].containers == {}
+
+
+async def test_stop_during_launch_discards_the_new_container(ctx: dict[str, Any]) -> None:
+    """DELETE lands while the container is coming up: the job must not flip it to running."""
+    sid = await _add(ctx)
+
+    async def user_deletes(sandbox_id: uuid.UUID) -> None:
+        await _set_status(ctx, sandbox_id, S.STOPPING)
+
+    ctx["runtime"].during_launch = user_deletes
+    assert await start_sandbox(ctx, str(sid), {}) == "cancelled"
+    assert (await _get(ctx, sid)).status == S.STOPPING
+    assert ctx["runtime"].containers == {}
+
+
+async def test_start_for_missing_sandbox_is_noop(ctx: dict[str, Any]) -> None:
     assert await start_sandbox(ctx, str(uuid.uuid4()), {}) == "missing"
+
+
+# --- stop_sandbox ----------------------------------------------------------------------
+
+
+async def test_stop_removes_container_and_marks_stopped(ctx: dict[str, Any]) -> None:
+    sid = await _add(ctx, S.STOPPING)
+    ctx["runtime"].containers[sid] = _in(600)
+    assert await stop_sandbox(ctx, str(sid), {}) == "stopped"
+    assert (await _get(ctx, sid)).status == S.STOPPED
+    assert ctx["runtime"].containers == {}
+
+
+async def test_stop_retries_when_docker_fails(ctx: dict[str, Any]) -> None:
+    sid = await _add(ctx, S.STOPPING)
+    ctx["runtime"].remove_error = TimeoutError()
+    with pytest.raises(Retry):
+        await stop_sandbox(ctx, str(sid), {})
+    ctx["job_try"] = ctx["settings"].job_max_tries
+    assert await stop_sandbox(ctx, str(sid), {}) == "failed"
+    assert (await _get(ctx, sid)).status == S.STOPPING  # left for the reaper, not lost
+
+
+# --- reconcile_sandboxes ---------------------------------------------------------------
+
+
+async def test_reaper_converges_docker_and_db(ctx: dict[str, Any]) -> None:
+    rt: FakeRuntime = ctx["runtime"]
+    healthy = await _add(ctx, S.RUNNING)
+    rt.containers[healthy] = _in(600)
+    expired = await _add(ctx, S.RUNNING)
+    rt.containers[expired] = _in(-1)
+    orphan_failed = await _add(ctx, S.FAILED)
+    rt.containers[orphan_failed] = _in(600)
+    orphan_unknown = uuid.uuid4()  # container whose row doesn't exist at all
+    rt.containers[orphan_unknown] = _in(600)
+    vanished = await _add(ctx, S.RUNNING)  # row says running, container is gone
+    lost_stop = await _add(ctx, S.STOPPING)  # stop job lost, container already gone
+
+    assert await reconcile_sandboxes(ctx) == {"expired": 1, "orphan": 2, "vanished": 1}
+
+    assert set(rt.containers) == {healthy}
+    assert (await _get(ctx, healthy)).status == S.RUNNING
+    assert (await _get(ctx, expired)).status == S.STOPPED
+    assert (await _get(ctx, orphan_failed)).status == S.FAILED  # terminal rows are kept
+    gone = await _get(ctx, vanished)
+    assert (gone.status, gone.error) == (S.FAILED, "container disappeared")
+    assert (await _get(ctx, lost_stop)).status == S.STOPPED
+
+
+async def test_reaper_leaves_starting_sandboxes_alone(ctx: dict[str, Any]) -> None:
+    """A container whose row is still `starting` is mid-launch, not an orphan."""
+    sid = await _add(ctx, S.STARTING)
+    ctx["runtime"].containers[sid] = _in(600)
+    assert await reconcile_sandboxes(ctx) == {"expired": 0, "orphan": 0, "vanished": 0}
+    assert sid in ctx["runtime"].containers
+
+
+async def test_reaper_failure_is_contained(ctx: dict[str, Any]) -> None:
+    ctx["runtime"].list_error = ConnectionError("docker down")
+    assert await reconcile_sandboxes(ctx) == {"expired": 0, "orphan": 0, "vanished": 0}

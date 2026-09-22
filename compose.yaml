@@ -41,6 +41,15 @@ services:
       SERVICE_NAME: duvo-worker
       OTEL_SERVICE_NAME: duvo-worker
       OTEL_PYTHON_DISABLED_INSTRUMENTATIONS: redis # arq polls Redis constantly: pure trace noise
+      SANDBOX_NETWORK: duvo-sandboxes
+    # SHORTCUT: the Docker socket is root-equivalent on the host whatever uid holds it, so
+    # running as root adds little risk and avoids host-specific docker-gid mapping. Real
+    # platform: a dedicated runtime (gVisor/Firecracker/k8s) behind a narrow API.
+    user: "0:0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # default: Postgres/Redis. sandboxes: readiness probes to the containers it launches.
+    networks: [default, sandboxes]
     ports: ["9100:9100"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=2)"]
@@ -106,3 +115,9 @@ services:
 
 volumes:
   pgdata:
+
+networks:
+  # Sandboxes run untrusted agent code: they get their own network, with no route to
+  # Postgres/Redis. Fixed name so the worker can attach containers to it.
+  sandboxes:
+    name: duvo-sandboxes

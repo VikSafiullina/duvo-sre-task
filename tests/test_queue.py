@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.queue import enqueue_start_sandbox, redis_settings
+from app.queue import START_SANDBOX, enqueue_sandbox_job, redis_settings
 
 
 def test_create_enqueues_one_job_and_counts_it(client: TestClient) -> None:
@@ -21,8 +21,8 @@ async def test_enqueue_is_idempotent_per_sandbox(settings: Settings) -> None:
     try:
         await queue.flushdb()
         sandbox_id = uuid.uuid4()
-        assert await enqueue_start_sandbox(queue, sandbox_id, timeout_s=1) is not None
-        assert await enqueue_start_sandbox(queue, sandbox_id, timeout_s=1) is None
+        assert await enqueue_sandbox_job(queue, START_SANDBOX, sandbox_id, 1) is not None
+        assert await enqueue_sandbox_job(queue, START_SANDBOX, sandbox_id, 1) is None
     finally:
         await queue.flushdb()
         await queue.aclose()

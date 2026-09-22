@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
 
-.PHONY: help up down restart ps logs test lint fmt smoke load chaos tf-validate rules-check scan check urls
+.PHONY: help up down sandboxes restart ps logs test lint fmt smoke load chaos tf-validate rules-check scan check urls
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -10,8 +10,12 @@ up: ## Build and start the full stack, wait until healthy
 	$(COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory urls
 
-down: ## Stop the stack and delete volumes
+down: ## Stop the stack, delete volumes and any sandbox containers
+	-docker ps -aq --filter label=duvo.sandbox.id | xargs docker rm -f >/dev/null 2>&1
 	$(COMPOSE) down -v --remove-orphans
+
+sandboxes: ## List sandbox containers the worker launched
+	docker ps -a --filter label=duvo.sandbox.id --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
 restart: ## Rebuild + restart only api and worker
 	$(COMPOSE) up -d --build --wait api worker

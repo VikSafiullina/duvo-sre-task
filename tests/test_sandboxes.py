@@ -1,7 +1,17 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from app.config import Settings
+
+
+def _create(client: TestClient, **body: object) -> str:
+    r = client.post("/sandboxes", json={"type": "http", **body})
+    assert r.status_code == 202, r.text
+    return r.json()["sandbox_id"]
 
 
 def test_create_accepts_and_get_returns_queued_sandbox(client: TestClient) -> None:
@@ -9,26 +19,57 @@ def test_create_accepts_and_get_returns_queued_sandbox(client: TestClient) -> No
     assert r.status_code == 202
     accepted = r.json()
     sandbox_id = accepted["sandbox_id"]
-    assert accepted == {
-        "job_id": f"start_sandbox:{sandbox_id}",
-        "sandbox_id": sandbox_id,
-        "type": "http",
-        "status": "queued",
-    }
+    assert accepted["job_id"] == f"start_sandbox:{sandbox_id}"
+    assert (accepted["type"], accepted["status"]) == ("http", "queued")
     sandbox = client.get(f"/sandboxes/{sandbox_id}").json()
-    assert sandbox["status"] == "queued"
-    assert sandbox["url"] is None
-    assert sandbox["attempts"] == 0
+    assert (sandbox["status"], sandbox["url"], sandbox["attempts"]) == ("queued", None, 0)
+
+
+def test_ttl_defaults_to_ten_minutes_and_is_honoured(client: TestClient) -> None:
+    default = client.post("/sandboxes", json={"type": "http"}).json()
+    custom = client.post("/sandboxes", json={"type": "http", "ttl_s": 120}).json()
+    now = datetime.now(UTC)
+    for body, ttl in ((default, 600), (custom, 120)):
+        expires = datetime.fromisoformat(body["expires_at"])
+        assert abs(expires - (now + timedelta(seconds=ttl))) < timedelta(seconds=5)
 
 
 @pytest.mark.parametrize(
     "body",
-    [{}, {"type": "ftp"}, {"type": "http", "image": "evil:latest"}, {"type": None}],
-    ids=["missing-type", "unknown-type", "unknown-field", "null-type"],
+    [
+        {},
+        {"type": "ftp"},
+        {"type": None},
+        {"type": "http", "image": "evil:latest"},
+        {"type": "http", "ttl_s": 59},
+        {"type": "http", "ttl_s": 3601},
+        {"type": "http", "ttl_s": "forever"},
+    ],
+    ids=[
+        "missing-type",
+        "unknown-type",
+        "null-type",
+        "unknown-field",
+        "ttl-low",
+        "ttl-high",
+        "ttl-str",
+    ],
 )
 def test_create_rejects_invalid_body(client: TestClient, body: dict[str, object]) -> None:
     assert client.post("/sandboxes", json=body).status_code == 422
     assert client.get("/sandboxes").json() == []  # nothing persisted, nothing enqueued
+
+
+def test_create_answers_429_at_capacity(
+    client: TestClient, app: FastAPI, settings: Settings
+) -> None:
+    app.state.settings = settings.model_copy(update={"sandbox_max_active": 2})
+    _create(client)
+    _create(client)
+    r = client.post("/sandboxes", json={"type": "http"})
+    assert r.status_code == 429
+    assert r.headers["retry-after"] == "30"
+    assert len(client.get("/sandboxes").json()) == 2
 
 
 def test_get_missing_sandbox_404(client: TestClient) -> None:
@@ -40,8 +81,49 @@ def test_get_malformed_id_422(client: TestClient) -> None:
 
 
 def test_list_newest_first_and_bounded(client: TestClient) -> None:
-    ids = [client.post("/sandboxes", json={"type": "http"}).json()["sandbox_id"] for _ in range(3)]
+    ids = [_create(client) for _ in range(3)]
     r = client.get("/sandboxes", params={"limit": 2})
     assert [s["id"] for s in r.json()] == [ids[2], ids[1]]
     assert client.get("/sandboxes", params={"limit": 1000}).status_code == 422
     assert client.get("/sandboxes", params={"limit": 0}).status_code == 422
+
+
+def test_delete_marks_stopping_and_enqueues_stop_once(client: TestClient) -> None:
+    sandbox_id = _create(client)
+    for _ in range(2):  # idempotent: second DELETE re-uses the same stop job id
+        r = client.delete(f"/sandboxes/{sandbox_id}")
+        assert r.status_code == 202
+        assert r.json()["status"] == "stopping"
+    body = client.get("/metrics").text
+    assert "queue_depth 2.0" in body  # one start + one stop
+    assert 'jobs_enqueued_total{job="stop_sandbox",outcome="enqueued"}' in body
+
+
+def test_delete_of_settled_sandbox_is_noop(client: TestClient, app: FastAPI) -> None:
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise ConnectionError("redis down")
+
+    real_enqueue = app.state.queue.enqueue_job
+    app.state.queue.enqueue_job = boom
+    client.post("/sandboxes", json={"type": "http"})  # -> failed (queue down)
+    app.state.queue.enqueue_job = real_enqueue
+    [sandbox] = client.get("/sandboxes").json()
+    r = client.delete(f"/sandboxes/{sandbox['id']}")
+    assert (r.status_code, r.json()["status"]) == (202, "failed")
+    assert "queue_depth 0.0" in client.get("/metrics").text
+
+
+def test_delete_missing_sandbox_404(client: TestClient) -> None:
+    assert client.delete(f"/sandboxes/{uuid.uuid4()}").status_code == 404
+
+
+def test_delete_with_queue_down_503_and_stays_stopping(client: TestClient, app: FastAPI) -> None:
+    """The row keeps the stop intent; the reaper finishes it even if nobody retries."""
+    sandbox_id = _create(client)
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise ConnectionError("redis down")
+
+    app.state.queue.enqueue_job = boom
+    assert client.delete(f"/sandboxes/{sandbox_id}").status_code == 503
+    assert client.get(f"/sandboxes/{sandbox_id}").json()["status"] == "stopping"
