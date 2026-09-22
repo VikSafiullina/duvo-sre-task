@@ -13,6 +13,7 @@ HTTP_LATENCY = Histogram(
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
 )
 # Producer side. outcome: enqueued | error (Redis down/slow => the sandbox is marked failed)
+# | deduplicated (Idempotency-Key replay: nothing enqueued; a spike = clients retrying)
 JOBS_ENQUEUED = Counter("jobs_enqueued_total", "Jobs handed to the queue", ["job", "outcome"])
 # Consumer side. outcome: success | retry | failed
 JOBS = Counter("jobs_total", "Background jobs by outcome", ["job", "outcome"])
