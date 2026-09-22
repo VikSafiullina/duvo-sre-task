@@ -23,7 +23,8 @@ Look for one route/error class dominating; open a ticket, fix in normal hours.
 
 ## JobFailureRateHigh
 1. Worker logs: `{service_name="duvo-worker"} |= "failed permanently"` (the `error` field names the cause).
-2. A shared cause (bad input, downstream outage) or random?
+2. A shared cause (bad input, downstream outage) or random? `TimeoutError` means the launch ran
+   past `LAUNCH_TIMEOUT_S` (45s): slow image pull or a struggling Docker daemon, not a bad request.
 
 **Mitigate:** fix/rollback · pause producers · request new sandboxes once fixed (failed rows keep the `error`; `GET /sandboxes/{id}` shows why).
 

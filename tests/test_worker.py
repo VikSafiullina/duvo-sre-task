@@ -1,9 +1,11 @@
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from arq import Retry
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.db import make_engine, make_sessionmaker
@@ -76,6 +78,34 @@ async def test_unexpected_error_retries_then_fails_visibly(
     sandbox = await _get(ctx, sandbox_id)
     assert sandbox.status == SandboxStatus.FAILED
     assert sandbox.error == "RuntimeError: docker exploded"
+
+
+async def test_hung_launch_times_out_into_retry_path(
+    ctx: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If arq's job_timeout fired instead, it would cancel the job: no retry, the sandbox
+    stuck in `starting`, and nothing in jobs_total for the failure alert to see."""
+
+    async def hang(sandbox: Sandbox, failure_rate: float) -> str:
+        await asyncio.sleep(5)
+        return "never"
+
+    monkeypatch.setattr("app.worker._launch", hang)
+    ctx["settings"] = ctx["settings"].model_copy(update={"launch_timeout_s": 0.05})
+    sandbox_id = await _add_sandbox(ctx)
+    with pytest.raises(Retry):
+        await start_sandbox(ctx, sandbox_id, {})
+    sandbox = await _get(ctx, sandbox_id)
+    assert sandbox.status == SandboxStatus.QUEUED
+    assert (sandbox.error or "").startswith("TimeoutError")
+    ctx["job_try"] = ctx["settings"].job_max_tries
+    assert await start_sandbox(ctx, sandbox_id, {}) == "failed"
+    assert (await _get(ctx, sandbox_id)).status == SandboxStatus.FAILED
+
+
+def test_launch_timeout_must_fit_inside_job_timeout() -> None:
+    with pytest.raises(ValidationError):
+        Settings(launch_timeout_s=60, job_timeout_s=60)
 
 
 async def test_success_after_retry_clears_error(ctx: dict[str, Any]) -> None:

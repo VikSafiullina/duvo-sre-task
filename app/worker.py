@@ -5,6 +5,7 @@ We call `run_worker` ourselves instead of the `arq` CLI so the CLI's logging dic
 doesn't replace the handlers OpenTelemetry installed.
 """
 
+import asyncio
 import logging
 import random
 import time
@@ -73,7 +74,8 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
                     extra={"sandbox_id": sandbox_id, "type": sandbox.type, "job_try": job_try},
                 )
                 try:
-                    url = await _launch(sandbox, settings.chaos_failure_rate)
+                    async with asyncio.timeout(settings.launch_timeout_s):
+                        url = await _launch(sandbox, settings.chaos_failure_rate)
                 except Exception as exc:
                     # Any failure (not only injected chaos) retries, then fails *visibly*:
                     # a sandbox must never be left in "starting" or missing from jobs_total.
@@ -129,7 +131,10 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = redis_settings(_settings)
     max_tries = _settings.job_max_tries
-    job_timeout = _settings.job_timeout_s
+    job_timeout = _settings.job_timeout_s  # backstop only: launch_timeout_s fires first
+    # SIGTERM (deploy, scale-in): stop picking jobs and let in-flight ones finish instead of
+    # cancelling them mid-launch. Jobs still running after the wait are re-run later.
+    job_completion_wait = _settings.worker_drain_s
     keep_result = 0  # no result retention => job-id dedupe window = queued/running only
     max_jobs = 10
     health_check_interval = 10
