@@ -30,9 +30,10 @@ Look for one route/error class dominating; open a ticket, fix in normal hours.
 
 ## SandboxQueueStalled
 **Meaning:** a sandbox request has waited > 60s for a worker to pick it up. Agents are blocked.
-1. Dashboard → "Queue depth by queue" and "Start outcomes / s": is anything being consumed at all?
-2. Worker up? `up{job="duvo-worker"}`, `make ps`, `make logs`. A crash loop at startup is often
-   Docker: the worker fails fast if the socket is unreachable.
+1. Which pool? Dashboard → "Queue depth by pool": a backlog on only one pool means that pool is
+   down or wedged (see [QueueNotDraining](#queuenotdraining)). `GET /rollout` shows how much traffic the canary gets.
+2. Worker up? `up{job="duvo-worker"}` per instance, `make ps`, `make logs`. A crash loop at startup
+   is often Docker: the worker fails fast if the socket is unreachable.
 3. Throughput dropped but not zero → "Job p95 duration": are starts slow (image pull, readiness)?
 
 **Mitigate:** restart/roll back the worker · scale workers (`max_jobs`) · if Docker is the cause,
@@ -64,6 +65,18 @@ TTL; to free it now, `DELETE /sandboxes/{id}`.
 **Mitigate:** raise the cap if the host has headroom (memory ≈ cap × `SANDBOX_MEMORY`) · add hosts ·
 ask heavy callers for shorter `ttl_s`.
 
+## QueueNotDraining
+**Meaning:** one pool (`deployment` label) has due jobs but finished none in 5 minutes: it is
+down, crash-looping or wedged. Every job routed to it waits; sandboxes stay `queued`.
+1. `curl localhost:8000/rollout`: how much traffic goes to the canary? `make ps`: is `worker-b` (canary) or `worker-a` (stable) up?
+2. `docker compose logs --tail=100 worker-b` (every worker log line carries `deployment` and `version`): crash at startup (Docker, DB) or a stuck job?
+
+**Mitigate (canary):** stop routing to it with `make rollout W=0` (new jobs and all stops go to stable at once).
+Then move jobs already queued for the canary to stable, atomically:
+`docker compose exec redis redis-cli EVAL "redis.call('ZUNIONSTORE', KEYS[1], 2, KEYS[1], KEYS[2], 'AGGREGATE', 'MIN'); return redis.call('DEL', KEYS[2])" 2 arq:queue arq:queue:canary`
+(arq job ids are global, so the stable pool runs them as-is; status CAS makes a double start impossible).
+**Mitigate (stable):** restart / roll back `worker-a`. Shifting traffic to an unproven canary is a last resort.
+
 ## TargetDown
 1. `make ps` — container crashed or restarting? `docker compose logs <svc> | tail`.
 2. Network/DNS between Prometheus and the target.
@@ -84,7 +97,7 @@ ask heavy callers for shorter `ttl_s`.
 **Meaning:** reconcile sweeps error out, so TTLs, leak cleanup and lost stops aren't handled.
 Containers pile up until the cap (`SANDBOX_MAX_ACTIVE`) answers 429 to everyone.
 1. Logs: `{service_name="duvo-worker"} |= "reconcile failed"`. The `exc` field has the cause.
-2. Docker daemon reachable from the worker? `docker compose exec worker python -c "import docker; docker.from_env().ping()"`.
+2. Docker daemon reachable from the worker? `docker compose exec worker-a python -c "import docker; docker.from_env().ping()"`.
 3. `make sandboxes`: how many are running and how old are they?
 
 **Mitigate:** restore Docker/DB access · manual cleanup: `docker rm -f $(docker ps -q --filter label=duvo.sandbox.id)`

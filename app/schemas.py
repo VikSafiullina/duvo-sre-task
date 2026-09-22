@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models import SandboxStatus, SandboxType
+from app.models import Deployment, SandboxStatus, SandboxType
 
 
 class SandboxCreate(BaseModel):
@@ -20,6 +20,7 @@ class SandboxOut(BaseModel):
     id: uuid.UUID
     type: SandboxType
     status: SandboxStatus
+    deployment: Deployment
     url: str | None
     error: str | None
     attempts: int
@@ -33,4 +34,16 @@ class SandboxAccepted(BaseModel):
     sandbox_id: uuid.UUID
     type: SandboxType
     status: SandboxStatus
+    deployment: Deployment
     expires_at: datetime
+
+
+class RolloutUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # strict: "50", 50.5 and true are 422s, not quietly coerced into a traffic shift.
+    canary_weight: int = Field(ge=0, le=100, strict=True)
+
+
+class RolloutOut(BaseModel):
+    canary_weight: int

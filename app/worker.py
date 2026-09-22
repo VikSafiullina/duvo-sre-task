@@ -35,10 +35,11 @@ from app.metrics import (
     RECONCILE_RUNS,
     SANDBOXES_REAPED,
     TIME_TO_RUNNING,
+    WORKER_INFO,
 )
 from app.models import ACTIVE_STATUSES, Sandbox, SandboxStatus
 from app.observability import setup_logging
-from app.queue import START_SANDBOX, STOP_SANDBOX, redis_settings
+from app.queue import QUEUES, START_SANDBOX, STOP_SANDBOX, redis_settings
 from app.runtime import DockerRuntime, SandboxRuntime
 
 log = logging.getLogger("app.worker")
@@ -83,7 +84,8 @@ def _observe_queue_wait(ctx: dict[str, Any], job: str) -> None:
     """First try only: a retry's wait is our own backoff, not queue pressure."""
     enqueued: datetime | None = ctx.get("enqueue_time")
     if ctx["job_try"] == 1 and enqueued is not None:
-        JOB_QUEUE_WAIT.labels(job).observe(max(0.0, (datetime.now(UTC) - enqueued).total_seconds()))
+        waited = max(0.0, (datetime.now(UTC) - enqueued).total_seconds())
+        JOB_QUEUE_WAIT.labels(job, ctx["settings"].deployment).observe(waited)
 
 
 async def _launch(runtime: SandboxRuntime, sandbox: Sandbox, failure_rate: float) -> str:
@@ -107,7 +109,7 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
             async with ctx["sessionmaker"]() as session:
                 sandbox = await session.get(Sandbox, sid)
                 if sandbox is None:
-                    JOBS.labels(START_SANDBOX, "failed").inc()
+                    JOBS.labels(START_SANDBOX, "failed", settings.deployment).inc()
                     log.warning("sandbox missing", extra={"sandbox_id": sandbox_id})
                     return "missing"
                 if sandbox.status not in _STARTABLE:
@@ -121,7 +123,7 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
                     await _transition(
                         session, sid, _STARTABLE, status=SandboxStatus.STOPPED, error="expired"
                     )
-                    JOBS.labels(START_SANDBOX, "expired").inc()
+                    JOBS.labels(START_SANDBOX, "expired", settings.deployment).inc()
                     log.warning("sandbox expired before start", extra={"sandbox_id": sandbox_id})
                     return "expired"
                 if not await _transition(
@@ -148,14 +150,14 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
                             session, sid, starting, status=SandboxStatus.QUEUED, error=reason
                         ):
                             return "cancelled"
-                        JOBS.labels(START_SANDBOX, "retry").inc()
+                        JOBS.labels(START_SANDBOX, "retry", settings.deployment).inc()
                         log.warning("sandbox start failed, retrying", extra=error)
                         # exponential backoff + jitter so retries don't synchronise
                         raise Retry(defer=2**job_try + random.uniform(0, 1)) from exc
                     await _transition(
                         session, sid, starting, status=SandboxStatus.FAILED, error=reason
                     )
-                    JOBS.labels(START_SANDBOX, "failed").inc()
+                    JOBS.labels(START_SANDBOX, "failed", settings.deployment).inc()
                     log.error("sandbox start failed permanently", extra=error)
                     return "failed"
                 if not await _transition(
@@ -172,9 +174,9 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
                         extra={"sandbox_id": sandbox_id},
                     )
                     return "cancelled"
-                JOBS.labels(START_SANDBOX, "success").inc()
+                JOBS.labels(START_SANDBOX, "success", settings.deployment).inc()
                 waited = (datetime.now(UTC) - sandbox.created_at).total_seconds()
-                TIME_TO_RUNNING.observe(waited)
+                TIME_TO_RUNNING.labels(settings.deployment).observe(waited)
                 log.info(
                     "sandbox running",
                     extra={
@@ -186,7 +188,9 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
                 )
                 return "running"
         finally:
-            JOB_LATENCY.labels(START_SANDBOX).observe(time.perf_counter() - start)
+            JOB_LATENCY.labels(START_SANDBOX, settings.deployment).observe(
+                time.perf_counter() - start
+            )
 
 
 async def stop_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[str, str]) -> str:
@@ -206,21 +210,23 @@ async def stop_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[str
                 span.record_exception(exc)
                 error = {"sandbox_id": sandbox_id, "job_try": job_try, "error": repr(exc)}
                 if job_try < settings.job_max_tries:
-                    JOBS.labels(STOP_SANDBOX, "retry").inc()
+                    JOBS.labels(STOP_SANDBOX, "retry", settings.deployment).inc()
                     log.warning("sandbox stop failed, retrying", extra=error)
                     raise Retry(defer=2**job_try + random.uniform(0, 1)) from exc
-                JOBS.labels(STOP_SANDBOX, "failed").inc()
+                JOBS.labels(STOP_SANDBOX, "failed", settings.deployment).inc()
                 log.error("sandbox stop failed permanently, reaper will retry", extra=error)
                 return "failed"
             async with ctx["sessionmaker"]() as session:
                 await _transition(
                     session, sid, {SandboxStatus.STOPPING}, status=SandboxStatus.STOPPED
                 )
-            JOBS.labels(STOP_SANDBOX, "success").inc()
+            JOBS.labels(STOP_SANDBOX, "success", settings.deployment).inc()
             log.info("sandbox stopped", extra={"sandbox_id": sandbox_id, "removed": removed})
             return "stopped"
         finally:
-            JOB_LATENCY.labels(STOP_SANDBOX).observe(time.perf_counter() - start)
+            JOB_LATENCY.labels(STOP_SANDBOX, settings.deployment).observe(
+                time.perf_counter() - start
+            )
 
 
 async def reconcile_sandboxes(ctx: dict[str, Any]) -> dict[str, int]:
@@ -292,14 +298,18 @@ async def reconcile_sandboxes(ctx: dict[str, Any]) -> dict[str, int]:
 
 async def startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, deployment=settings.deployment, version=settings.version)
     ctx["settings"] = settings
     ctx["engine"] = make_engine(settings)
     ctx["sessionmaker"] = make_sessionmaker(ctx["engine"])
     ctx["runtime"] = await asyncio.to_thread(DockerRuntime, settings)  # blocking daemon ping
     await ctx["runtime"].prepare()
     start_http_server(settings.worker_metrics_port)
-    log.info("worker started", extra={"metrics_port": settings.worker_metrics_port})
+    WORKER_INFO.labels(settings.deployment, settings.version).set(1)
+    log.info(
+        "worker started",
+        extra={"metrics_port": settings.worker_metrics_port, "queue": QUEUES[settings.deployment]},
+    )
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
@@ -312,6 +322,9 @@ _settings = get_settings()
 
 class WorkerSettings:
     functions = [start_sandbox, stop_sandbox]  # noqa: RUF012 — arq reads class attributes
+    # Both pools schedule the reaper, but a cron job id is `reconcile_sandboxes:{tick}` and
+    # arq job ids are global across queues: one sweep per tick runs, on whichever pool
+    # enqueued it first. (A rare double sweep is harmless: CAS writes, idempotent removes.)
     cron_jobs = [  # noqa: RUF012
         cron(
             reconcile_sandboxes,
@@ -323,6 +336,7 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = redis_settings(_settings)
+    queue_name = QUEUES[_settings.deployment]  # each pool consumes only its own queue
     max_tries = _settings.job_max_tries
     job_timeout = _settings.job_timeout_s  # backstop only: launch_timeout_s fires first
     # SIGTERM (deploy, scale-in): stop picking jobs and let in-flight ones finish instead of

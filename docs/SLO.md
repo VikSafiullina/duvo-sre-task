@@ -18,6 +18,7 @@ so it goes red for a stalled queue, a slow image pull or a broken sandbox image 
 | ApiLatencyHigh | p95 > 500ms for 10m | — | ticket |
 | JobFailureRateHigh | > 5% permanent failures over 15m, for 5m | start success | page |
 | SandboxQueueStalled | oldest queued sandbox > 60s, for 1m | — | page |
+| QueueNotDraining | a pool has due jobs but finished none in 5m, for 5m | — | page |
 | SandboxStartSlow | p95 time-to-running > 10s for 10m | freshness | ticket |
 | SandboxStuckInTransition | a sandbox `starting`/`stopping` > 2m, for 2m | — | ticket |
 | SandboxCapacityHigh | > 80% of the admission cap for 10m | — | ticket |

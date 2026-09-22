@@ -1,31 +1,39 @@
-"""Prometheus scrape endpoint. State that lives in Redis (queue depth) and Postgres (sandbox
-lifecycle) is sampled here, at scrape time, so the numbers are exactly as fresh as the scrape
-and no background poller can silently die."""
+"""Prometheus scrape endpoint. State that lives in Redis (queue depth, rollout weight) and
+Postgres (sandbox lifecycle) is sampled here, at scrape time, so the numbers are exactly as
+fresh as the scrape and no background poller can silently die."""
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 
-from arq.constants import default_queue_name
 from fastapi import APIRouter, Request, Response
 from opentelemetry.instrumentation.utils import suppress_instrumentation
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import func, select
 
-from app.metrics import QUEUE_DEPTH, SANDBOX_CAPACITY, SANDBOX_OLDEST, SANDBOXES_ACTIVE
+from app.metrics import (
+    QUEUE_DEPTH,
+    ROLLOUT_CANARY_WEIGHT,
+    SANDBOX_CAPACITY,
+    SANDBOX_OLDEST,
+    SANDBOXES_ACTIVE,
+)
 from app.models import ACTIVE_STATUSES, Sandbox
+from app.queue import QUEUES
+from app.rollout import get_weight
 
 router = APIRouter(tags=["ops"])
 log = logging.getLogger("app.metrics")
 
-QUEUES = (default_queue_name,)
-
 
 async def _sample_queues(request: Request) -> None:
-    state = request.app.state
-    async with asyncio.timeout(state.settings.redis_timeout_s):
-        for queue in QUEUES:
-            QUEUE_DEPTH.labels(queue).set(await state.queue.zcard(queue))
+    queue, timeout_s = request.app.state.queue, request.app.state.settings.redis_timeout_s
+    now_ms = int(time.time() * 1000)  # arq scores jobs by when they're due, in ms
+    async with asyncio.timeout(timeout_s):
+        for deployment, name in QUEUES.items():
+            QUEUE_DEPTH.labels(deployment).set(await queue.zcount(name, "-inf", now_ms))
+        ROLLOUT_CANARY_WEIGHT.set(await get_weight(queue, timeout_s))
 
 
 async def _sample_sandboxes(request: Request) -> None:
@@ -46,7 +54,7 @@ async def _sample_sandboxes(request: Request) -> None:
 
 
 _SAMPLERS = (
-    (_sample_queues, (QUEUE_DEPTH,)),
+    (_sample_queues, (QUEUE_DEPTH, ROLLOUT_CANARY_WEIGHT)),
     (_sample_sandboxes, (SANDBOXES_ACTIVE, SANDBOX_OLDEST)),
 )
 

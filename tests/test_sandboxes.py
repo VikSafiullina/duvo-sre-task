@@ -21,7 +21,11 @@ def test_create_accepts_and_get_returns_queued_sandbox(client: TestClient) -> No
     accepted = r.json()
     sandbox_id = accepted["sandbox_id"]
     assert accepted["job_id"] == f"start_sandbox:{sandbox_id}"
-    assert (accepted["type"], accepted["status"]) == ("http", "queued")
+    assert (accepted["type"], accepted["status"], accepted["deployment"]) == (
+        "http",
+        "queued",
+        "stable",
+    )
     sandbox = client.get(f"/sandboxes/{sandbox_id}").json()
     assert (sandbox["status"], sandbox["url"], sandbox["attempts"]) == ("queued", None, 0)
 
@@ -71,8 +75,14 @@ def test_idempotency_key_replays_original_sandbox(client: TestClient) -> None:
     assert replay.headers["idempotent-replayed"] == "true"
     assert "idempotent-replayed" not in first.headers
     assert len(client.get("/sandboxes").json()) == 1
-    assert metric(client, "queue_depth", queue="arq:queue") == 1  # one job, not two
-    assert metric(client, "jobs_enqueued_total", task="start_sandbox", outcome="deduplicated")
+    assert metric(client, "queue_depth", deployment="stable") == 1  # one job, not two
+    assert metric(
+        client,
+        "jobs_enqueued_total",
+        deployment="stable",
+        task="start_sandbox",
+        outcome="deduplicated",
+    )
 
 
 def test_different_idempotency_keys_create_different_sandboxes(client: TestClient) -> None:
@@ -136,8 +146,10 @@ def test_delete_marks_stopping_and_enqueues_stop_once(client: TestClient) -> Non
         r = client.delete(f"/sandboxes/{sandbox_id}")
         assert r.status_code == 202
         assert r.json()["status"] == "stopping"
-    assert metric(client, "queue_depth", queue="arq:queue") == 2  # one start + one stop
-    assert metric(client, "jobs_enqueued_total", task="stop_sandbox", outcome="enqueued")
+    assert metric(client, "queue_depth", deployment="stable") == 2  # one start + one stop
+    assert metric(
+        client, "jobs_enqueued_total", deployment="stable", task="stop_sandbox", outcome="enqueued"
+    )
 
 
 def test_delete_of_settled_sandbox_is_noop(client: TestClient, app: FastAPI) -> None:
@@ -151,7 +163,7 @@ def test_delete_of_settled_sandbox_is_noop(client: TestClient, app: FastAPI) -> 
     [sandbox] = client.get("/sandboxes").json()
     r = client.delete(f"/sandboxes/{sandbox['id']}")
     assert (r.status_code, r.json()["status"]) == (202, "failed")
-    assert metric(client, "queue_depth", queue="arq:queue") == 0
+    assert metric(client, "queue_depth", deployment="stable") == 0
 
 
 def test_delete_missing_sandbox_404(client: TestClient) -> None:

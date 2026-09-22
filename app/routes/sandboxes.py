@@ -15,6 +15,7 @@ from app.deps import QueueDep, SessionDep, SettingsDep
 from app.metrics import JOBS_ENQUEUED
 from app.models import ACTIVE_STATUSES, Sandbox, SandboxStatus
 from app.queue import START_SANDBOX, STOP_SANDBOX, enqueue_sandbox_job, sandbox_job_id
+from app.rollout import pick_deployment
 from app.schemas import SandboxAccepted, SandboxCreate, SandboxOut
 
 router = APIRouter(prefix="/sandboxes", tags=["sandboxes"])
@@ -41,6 +42,7 @@ def _accepted(sandbox: Sandbox) -> SandboxAccepted:
         sandbox_id=sandbox.id,
         type=sandbox.type,
         status=sandbox.status,
+        deployment=sandbox.deployment,
         expires_at=sandbox.expires_at,
     )
 
@@ -50,7 +52,7 @@ async def _replay(session: AsyncSession, key: str, response: Response) -> Sandbo
     original = await session.scalar(select(Sandbox).where(Sandbox.idempotency_key == key))
     if original is None:
         return None
-    JOBS_ENQUEUED.labels(START_SANDBOX, "deduplicated").inc()
+    JOBS_ENQUEUED.labels(START_SANDBOX, "deduplicated", original.deployment).inc()
     log.info("idempotent replay", extra={"sandbox_id": str(original.id)})
     response.headers["Idempotent-Replayed"] = "true"
     return _accepted(original)
@@ -85,10 +87,14 @@ async def create_sandbox(
             f"sandbox capacity reached ({settings.sandbox_max_active}), retry later",
             headers={"Retry-After": "30"},
         )
+    sandbox_id = uuid.uuid4()  # routing is keyed on the id, so it's chosen up front
+    deployment = await pick_deployment(queue, sandbox_id, settings.redis_timeout_s)
     expires_at = datetime.now(UTC) + timedelta(seconds=body.ttl_s)
     sandbox = Sandbox(
+        id=sandbox_id,
         type=body.type,
         status=SandboxStatus.QUEUED,
+        deployment=deployment,
         expires_at=expires_at,
         idempotency_key=idempotency_key,
     )
@@ -101,19 +107,19 @@ async def create_sandbox(
             return replay
         raise
     job_id = sandbox_job_id(START_SANDBOX, sandbox.id)
+    ids = {"sandbox_id": str(sandbox.id), "job_id": job_id, "deployment": deployment}
     try:
-        await enqueue_sandbox_job(queue, START_SANDBOX, sandbox.id, settings.redis_timeout_s)
+        await enqueue_sandbox_job(
+            queue, START_SANDBOX, sandbox.id, settings.redis_timeout_s, deployment
+        )
     except Exception as exc:
-        JOBS_ENQUEUED.labels(START_SANDBOX, "error").inc()
-        log.exception("enqueue failed", extra={"sandbox_id": str(sandbox.id), "job_id": job_id})
+        JOBS_ENQUEUED.labels(START_SANDBOX, "error", deployment).inc()
+        log.exception("enqueue failed", extra=ids)
         sandbox.status, sandbox.error = SandboxStatus.FAILED, f"enqueue: {type(exc).__name__}"
         await session.commit()
         raise _503 from None
-    JOBS_ENQUEUED.labels(START_SANDBOX, "enqueued").inc()
-    log.info(
-        "sandbox requested",
-        extra={"sandbox_id": str(sandbox.id), "job_id": job_id, "type": sandbox.type},
-    )
+    JOBS_ENQUEUED.labels(START_SANDBOX, "enqueued", deployment).inc()
+    log.info("sandbox requested", extra={**ids, "type": sandbox.type})
     return _accepted(sandbox)
 
 
@@ -150,13 +156,19 @@ async def stop_sandbox(
     await session.refresh(sandbox)
     if sandbox.status != SandboxStatus.STOPPING:
         return sandbox  # settled some other way in between
+    # Routed by the *current* weight, not the pool that started it: after a rollback, stops
+    # go to stable at once. Any pool can remove any sandbox (same Docker host, same labels).
+    deployment = await pick_deployment(queue, sandbox.id, settings.redis_timeout_s)
     job_id = sandbox_job_id(STOP_SANDBOX, sandbox.id)
+    ids = {"sandbox_id": str(sandbox.id), "job_id": job_id, "deployment": deployment}
     try:
-        await enqueue_sandbox_job(queue, STOP_SANDBOX, sandbox.id, settings.redis_timeout_s)
+        await enqueue_sandbox_job(
+            queue, STOP_SANDBOX, sandbox.id, settings.redis_timeout_s, deployment
+        )
     except Exception:
-        JOBS_ENQUEUED.labels(STOP_SANDBOX, "error").inc()
-        log.exception("enqueue failed", extra={"sandbox_id": str(sandbox.id), "job_id": job_id})
+        JOBS_ENQUEUED.labels(STOP_SANDBOX, "error", deployment).inc()
+        log.exception("enqueue failed", extra=ids)
         raise _503 from None
-    JOBS_ENQUEUED.labels(STOP_SANDBOX, "enqueued").inc()
-    log.info("sandbox stop requested", extra={"sandbox_id": str(sandbox.id), "job_id": job_id})
+    JOBS_ENQUEUED.labels(STOP_SANDBOX, "enqueued", deployment).inc()
+    log.info("sandbox stop requested", extra=ids)
     return sandbox

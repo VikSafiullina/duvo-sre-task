@@ -49,7 +49,7 @@ def test_lifecycle_gauges_sampled_from_db(client: TestClient) -> None:
     assert m[("sandbox_oldest_in_status_seconds", (("status", "queued"),))] > 0
     assert m[("sandbox_oldest_in_status_seconds", (("status", "running"),))] == 0
     assert m[("sandbox_capacity", ())] == 50
-    assert m[("queue_depth", (("queue", "arq:queue"),))] == 2
+    assert m[("queue_depth", (("deployment", "stable"),))] == 2
 
 
 def test_scrape_survives_db_outage_and_drops_stale_gauges(client: TestClient, app: FastAPI) -> None:
@@ -64,7 +64,7 @@ def test_scrape_survives_db_outage_and_drops_stale_gauges(client: TestClient, ap
     assert r.status_code == 200
     m = _samples(client)
     assert not any(name == "sandboxes_active" for name, _ in m)  # unknown, not frozen
-    assert ("queue_depth", (("queue", "arq:queue"),)) in m  # other samplers unaffected
+    assert ("queue_depth", (("deployment", "stable"),)) in m  # other samplers unaffected
 
 
 def test_scrape_survives_redis_outage(client: TestClient, app: FastAPI) -> None:

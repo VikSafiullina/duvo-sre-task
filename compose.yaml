@@ -20,6 +20,33 @@ x-app: &app
   image: duvo-app:local
   restart: unless-stopped
 
+x-worker-env: &worker-env
+  <<: *app-env
+  SERVICE_NAME: duvo-worker
+  OTEL_SERVICE_NAME: duvo-worker
+  OTEL_PYTHON_DISABLED_INSTRUMENTATIONS: redis # arq polls Redis constantly: pure trace noise
+  SANDBOX_NETWORK: duvo-sandboxes
+
+x-worker: &worker
+  <<: *app
+  command: ["opentelemetry-instrument", "python", "-m", "app.worker"]
+  # SHORTCUT: the Docker socket is root-equivalent on the host whatever uid holds it, so
+  # running as root adds little risk and avoids host-specific docker-gid mapping. Real
+  # platform: a dedicated runtime (gVisor/Firecracker/k8s) behind a narrow API.
+  user: "0:0"
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  # default: Postgres/Redis. sandboxes: readiness probes to the containers it launches.
+  networks: [default, sandboxes]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=2)"]
+    interval: 10s
+    timeout: 3s
+    retries: 3
+    start_period: 10s
+  depends_on:
+    api: { condition: service_healthy } # api owns schema creation
+
 services:
   api:
     <<: *app
@@ -33,32 +60,26 @@ services:
       redis: { condition: service_healthy }
       lgtm: { condition: service_started }
 
-  worker:
-    <<: *app
-    command: ["opentelemetry-instrument", "python", "-m", "app.worker"]
+  # A/B: two pools of the same worker, each consuming its own queue (app/queue.py QUEUES).
+  # The API routes each job by the canary weight (PUT /rollout). Locally both run the same
+  # image; VERSION is what a real rollout would change.
+  worker-a:
+    <<: *worker
     environment:
-      <<: *app-env
-      SERVICE_NAME: duvo-worker
-      OTEL_SERVICE_NAME: duvo-worker
-      OTEL_PYTHON_DISABLED_INSTRUMENTATIONS: redis # arq polls Redis constantly: pure trace noise
-      SANDBOX_NETWORK: duvo-sandboxes
-    # SHORTCUT: the Docker socket is root-equivalent on the host whatever uid holds it, so
-    # running as root adds little risk and avoids host-specific docker-gid mapping. Real
-    # platform: a dedicated runtime (gVisor/Firecracker/k8s) behind a narrow API.
-    user: "0:0"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    # default: Postgres/Redis. sandboxes: readiness probes to the containers it launches.
-    networks: [default, sandboxes]
+      <<: *worker-env
+      DEPLOYMENT: stable
+      VERSION: v1
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=local,service.version=v1
     ports: ["9100:9100"]
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=2)"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
-    depends_on:
-      api: { condition: service_healthy } # api owns schema creation
+
+  worker-b:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      DEPLOYMENT: canary
+      VERSION: v2
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=local,service.version=v2
+    ports: ["9101:9100"]
 
   postgres:
     image: postgres:17-alpine

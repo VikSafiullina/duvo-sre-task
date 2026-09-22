@@ -21,12 +21,17 @@ _RESERVED = set(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
 
 
 class JsonFormatter(logging.Formatter):
+    def __init__(self, static: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self.static = static or {}  # stamped on every line, e.g. which worker pool wrote it
+
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, object] = {
             "ts": datetime.fromtimestamp(record.created, UTC).isoformat(),
             "severity": record.levelname,  # `severity` is what Cloud Logging parses
             "logger": record.name,
             "msg": record.getMessage(),
+            **self.static,
         }
         span = trace.get_current_span().get_span_context()
         if span.is_valid:
@@ -39,11 +44,11 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
-def setup_logging(level: str) -> None:
+def setup_logging(level: str, **static: str) -> None:
     """Send `app.*` logs to stdout as JSON. Propagation stays on, so the OTel handler that
     auto-instrumentation installs on the root logger also ships them to Loki."""
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
+    handler.setFormatter(JsonFormatter(static))
     logger = logging.getLogger("app")
     logger.handlers[:] = [handler]
     logger.setLevel(level)

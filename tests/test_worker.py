@@ -11,9 +11,10 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.db import make_engine, make_sessionmaker
-from app.models import Sandbox, SandboxStatus, SandboxType
+from app.models import Deployment, Sandbox, SandboxStatus, SandboxType
+from app.queue import QUEUES, START_SANDBOX
 from app.runtime import SandboxNotReady
-from app.worker import reconcile_sandboxes, start_sandbox, stop_sandbox
+from app.worker import WorkerSettings, reconcile_sandboxes, start_sandbox, stop_sandbox
 from tests.support import FakeRuntime, reset_state
 
 S = SandboxStatus
@@ -177,23 +178,39 @@ def _sample(name: str, **labels: str) -> float:
 
 
 async def test_start_records_time_to_running(ctx: dict[str, Any]) -> None:
-    before = _sample("sandbox_time_to_running_seconds_count")
+    before = _sample("sandbox_time_to_running_seconds_count", deployment="stable")
     await start_sandbox(ctx, str(await _add(ctx)), {})
-    assert _sample("sandbox_time_to_running_seconds_count") == before + 1
+    assert _sample("sandbox_time_to_running_seconds_count", deployment="stable") == before + 1
 
 
 async def test_queue_wait_measured_on_first_try_only(ctx: dict[str, Any]) -> None:
     """Retries wait on purpose (backoff): counting them would fake queue pressure."""
-    count = ("job_queue_wait_seconds_count", {"task": "start_sandbox"})
-    total = ("job_queue_wait_seconds_sum", {"task": "start_sandbox"})
-    before_n, before_sum = _sample(count[0], **count[1]), _sample(total[0], **total[1])
+    labels = {"task": "start_sandbox", "deployment": "stable"}
+    before_n = _sample("job_queue_wait_seconds_count", **labels)
+    before_sum = _sample("job_queue_wait_seconds_sum", **labels)
     ctx["enqueue_time"] = datetime.now(UTC) - timedelta(seconds=3)
     await start_sandbox(ctx, str(await _add(ctx)), {})
-    assert _sample(count[0], **count[1]) == before_n + 1
-    assert _sample(total[0], **total[1]) - before_sum >= 3
+    assert _sample("job_queue_wait_seconds_count", **labels) == before_n + 1
+    assert _sample("job_queue_wait_seconds_sum", **labels) - before_sum >= 3
     ctx["job_try"] = 2
     await start_sandbox(ctx, str(await _add(ctx)), {})
-    assert _sample(count[0], **count[1]) == before_n + 1
+    assert _sample("job_queue_wait_seconds_count", **labels) == before_n + 1
+
+
+async def test_outcomes_are_labelled_with_the_workers_pool(ctx: dict[str, Any]) -> None:
+    """The rollout compares pools on this label, so a canary must never count as stable."""
+    ctx["settings"] = ctx["settings"].model_copy(update={"deployment": Deployment.CANARY})
+    labels = {"task": START_SANDBOX, "outcome": "success", "deployment": "canary"}
+    before = REGISTRY.get_sample_value("jobs_total", labels) or 0.0
+    ttr_before = _sample("sandbox_time_to_running_seconds_count", deployment="canary")
+    sid = await _add(ctx)
+    assert await start_sandbox(ctx, str(sid), {}) == "running"
+    assert REGISTRY.get_sample_value("jobs_total", labels) == before + 1
+    assert _sample("sandbox_time_to_running_seconds_count", deployment="canary") == ttr_before + 1
+
+
+def test_worker_consumes_its_own_pools_queue() -> None:
+    assert WorkerSettings.queue_name == QUEUES[Settings().deployment] == "arq:queue"
 
 
 # --- stop_sandbox ----------------------------------------------------------------------

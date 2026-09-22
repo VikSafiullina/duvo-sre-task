@@ -12,8 +12,10 @@ from tests.support import metric
 
 def test_create_enqueues_one_job_and_counts_it(client: TestClient) -> None:
     assert client.post("/sandboxes", json={"type": "http"}).status_code == 202
-    assert metric(client, "queue_depth", queue="arq:queue") == 1
-    assert metric(client, "jobs_enqueued_total", task="start_sandbox", outcome="enqueued")
+    assert metric(client, "queue_depth", deployment="stable") == 1
+    assert metric(
+        client, "jobs_enqueued_total", deployment="stable", task="start_sandbox", outcome="enqueued"
+    )
 
 
 async def test_enqueue_is_idempotent_per_sandbox(settings: Settings) -> None:
@@ -37,7 +39,9 @@ def test_queue_down_returns_503_and_marks_sandbox_failed(client: TestClient, app
     [sandbox] = client.get("/sandboxes").json()
     assert sandbox["status"] == "failed"
     assert sandbox["error"] == "enqueue: ConnectionError"
-    assert metric(client, "jobs_enqueued_total", task="start_sandbox", outcome="error")
+    assert metric(
+        client, "jobs_enqueued_total", deployment="stable", task="start_sandbox", outcome="error"
+    )
 
 
 def test_slow_queue_times_out_instead_of_hanging(

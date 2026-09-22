@@ -4,6 +4,8 @@ from typing import Self
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.models import Deployment
+
 
 class Settings(BaseSettings):
     """All runtime configuration, read from environment variables (12-factor)."""
@@ -20,6 +22,10 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     redis_timeout_s: float = 2.0
+
+    # Worker only: which pool this process is and what it runs. Each pool has its own queue.
+    deployment: Deployment = Deployment.STABLE
+    version: str = "dev"
 
     job_max_tries: int = 3
     job_timeout_s: int = 90  # arq backstop; must cover launch + cleanup + DB writes

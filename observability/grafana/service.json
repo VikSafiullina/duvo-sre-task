@@ -475,8 +475,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outcome) (rate(jobs_total{task=\"start_sandbox\"}[1m]))",
-          "legendFormat": "{{outcome}}"
+          "expr": "sum by (deployment, outcome) (rate(jobs_total{task=\"start_sandbox\"}[1m]))",
+          "legendFormat": "{{deployment}} {{outcome}}"
         }
       ]
     },
@@ -694,15 +694,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le, task) (rate(job_duration_seconds_bucket[5m])))",
-          "legendFormat": "{{task}}"
+          "expr": "histogram_quantile(0.95, sum by (le, task, deployment) (rate(job_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{deployment}} {{task}}"
         }
       ]
     },
     {
       "id": 15,
       "type": "row",
-      "title": "Queue & producer",
+      "title": "Rollout (A/B)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -715,21 +715,21 @@
     {
       "id": 16,
       "type": "timeseries",
-      "title": "Queue depth by queue",
-      "description": "",
+      "title": "Canary weight",
+      "description": "Share of new jobs routed to worker-b (PUT /rollout)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 6,
         "x": 0,
         "y": 31
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "percent",
           "custom": {
             "fillOpacity": 8,
             "lineWidth": 1,
@@ -750,24 +750,67 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (queue) (queue_depth{job=\"duvo-api\"})",
-          "legendFormat": "{{queue}}"
+          "expr": "max(rollout_canary_weight)",
+          "legendFormat": "canary %"
         }
       ]
     },
     {
       "id": 17,
       "type": "timeseries",
-      "title": "Queue wait p95",
-      "description": "Enqueue -> first pickup (first try only)",
+      "title": "Start success by pool (5m)",
+      "description": "Canary below stable = do not promote",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 6,
+        "x": 6,
+        "y": 31
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (deployment) (rate(jobs_total{task=\"start_sandbox\",outcome=\"success\"}[5m])) / sum by (deployment) (rate(jobs_total{task=\"start_sandbox\",outcome=~\"success|failed\"}[5m]))",
+          "legendFormat": "{{deployment}}"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Time to running p95 by pool",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
         "y": 31
       },
       "fieldConfig": {
@@ -793,13 +836,146 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le, task) (rate(job_queue_wait_seconds_bucket[5m])))",
-          "legendFormat": "{{task}}"
+          "expr": "histogram_quantile(0.95, sum by (le, deployment) (rate(sandbox_time_to_running_seconds_bucket[5m])))",
+          "legendFormat": "{{deployment}}"
         }
       ]
     },
     {
-      "id": 18,
+      "id": 19,
+      "type": "table",
+      "title": "Worker versions",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 31
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (deployment, version) (worker_info)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Queue & producer",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Queue depth by pool",
+      "description": "Due jobs only (deferred retries excluded)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (deployment) (queue_depth{job=\"duvo-api\"})",
+          "legendFormat": "{{deployment}}"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Queue wait p95",
+      "description": "Enqueue -> first pickup (first try only)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, task, deployment) (rate(job_queue_wait_seconds_bucket[5m])))",
+          "legendFormat": "{{deployment}} {{task}}"
+        }
+      ]
+    },
+    {
+      "id": 23,
       "type": "timeseries",
       "title": "Producer / s",
       "description": "Enqueue errors mean Redis is down or slow: sandbox marked failed, caller gets 503",
@@ -811,7 +987,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 31
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
@@ -847,7 +1023,7 @@
       ]
     },
     {
-      "id": 19,
+      "id": 24,
       "type": "row",
       "title": "API",
       "collapsed": false,
@@ -855,12 +1031,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 48
       },
       "panels": []
     },
     {
-      "id": 20,
+      "id": 25,
       "type": "timeseries",
       "title": "Requests / s by route",
       "description": "",
@@ -872,7 +1048,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 40
+        "y": 49
       },
       "fieldConfig": {
         "defaults": {
@@ -903,7 +1079,7 @@
       ]
     },
     {
-      "id": 21,
+      "id": 26,
       "type": "timeseries",
       "title": "5xx error ratio (SLO budget line 0.5%)",
       "description": "",
@@ -915,7 +1091,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 40
+        "y": 49
       },
       "fieldConfig": {
         "defaults": {
@@ -951,7 +1127,7 @@
       ]
     },
     {
-      "id": 22,
+      "id": 27,
       "type": "timeseries",
       "title": "API latency p50 / p95 / p99",
       "description": "",
@@ -963,7 +1139,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 40
+        "y": 49
       },
       "fieldConfig": {
         "defaults": {
@@ -1004,10 +1180,10 @@
       ]
     },
     {
-      "id": 23,
+      "id": 28,
       "type": "stat",
       "title": "Targets up",
-      "description": "",
+      "description": "api + worker-a (stable) + worker-b (canary)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1016,7 +1192,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 48
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -1031,7 +1207,7 @@
               },
               {
                 "color": "green",
-                "value": 2
+                "value": 3
               }
             ]
           }
@@ -1059,7 +1235,7 @@
       ]
     },
     {
-      "id": 24,
+      "id": 29,
       "type": "stat",
       "title": "Jobs failed permanently (15m)",
       "description": "",
@@ -1071,7 +1247,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 48
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -1115,7 +1291,7 @@
       ]
     },
     {
-      "id": 25,
+      "id": 30,
       "type": "stat",
       "title": "Enqueue errors (15m)",
       "description": "",
@@ -1127,7 +1303,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 48
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -1171,7 +1347,7 @@
       ]
     },
     {
-      "id": 26,
+      "id": 31,
       "type": "stat",
       "title": "Leaked sandboxes reaped (15m)",
       "description": "",
@@ -1183,7 +1359,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 48
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -1227,7 +1403,7 @@
       ]
     },
     {
-      "id": 27,
+      "id": 32,
       "type": "row",
       "title": "Logs",
       "collapsed": false,
@@ -1235,12 +1411,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 61
       },
       "panels": []
     },
     {
-      "id": 28,
+      "id": 33,
       "type": "logs",
       "title": "Sandbox lifecycle events",
       "description": "One line per lifecycle transition; filter by sandbox_id to follow one sandbox",
@@ -1252,7 +1428,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 62
       },
       "options": {
         "showTime": true,
@@ -1267,7 +1443,7 @@
       ]
     },
     {
-      "id": 29,
+      "id": 34,
       "type": "logs",
       "title": "All logs (api + worker)",
       "description": "",
@@ -1279,7 +1455,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 71
       },
       "options": {
         "showTime": true,
