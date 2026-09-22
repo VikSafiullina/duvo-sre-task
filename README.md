@@ -1,5 +1,7 @@
 # duvo-sre-task
 
+**Screen recording of the timed session:** https://drive.google.com/drive/folders/1oxFITzDr9Q2YyRKrB-IRlUsjBnXcmIgf?usp=drive_link
+
 > **Pre-task scaffold.** Everything up to tag `pre-task-scaffold` was prepared *before* the timed
 > window: a generic, production-shaped service skeleton (API + worker, health probes, metrics,
 > traces, logs, SLO alerts, Docker, Terraform for Cloud Run, CI). Work on the actual task starts
@@ -173,7 +175,7 @@ before the window.
 | 17:45–17:59 | Slice 4: step 4 A/B (parallel worktree) | merged after the write-up (below) |
 | — | Step 5 metric cutover | **cut** (not started) |
 | 17:59–18:04 | README, SLO, runbook | on `main` |
-| 18:04–18:20 | Merge Slice 4 into `main` (past the window) | on `main`, `make lint test smoke` green |
+| 18:04–18:13 | Merge Slice 4 into `main` (past the window) | on `main`, `make lint test smoke` green |
 
 **What I cut, and why:**
 - **Step 5 (automated cutover).** It depends on step 4, and there wasn't time for both. The design (gates,
