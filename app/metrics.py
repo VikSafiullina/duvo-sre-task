@@ -1,5 +1,6 @@
-"""Prometheus metrics. Labels are route templates / enums only — never IDs — so cardinality
-stays bounded no matter what callers send."""
+"""Prometheus metrics. Labels are route templates / enums only — never IDs or raw caller
+input (unknown HTTP methods become OTHER) — so cardinality stays bounded no matter what
+callers send."""
 
 from prometheus_client import Counter, Gauge, Histogram
 

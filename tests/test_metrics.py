@@ -16,6 +16,14 @@ def test_unknown_paths_do_not_explode_cardinality(client: TestClient) -> None:
     assert 'route="unmatched"' in body
 
 
+def test_unknown_http_methods_do_not_explode_cardinality(client: TestClient) -> None:
+    for method in ("SPAM1", "SPAM2"):
+        client.request(method, "/sandboxes")
+    body = client.get("/metrics").text
+    assert "SPAM" not in body
+    assert 'http_requests_total{method="OTHER",route=' in body
+
+
 def test_request_id_echoed_or_generated(client: TestClient) -> None:
     echoed = client.get("/healthz", headers={"x-request-id": "abc123"})
     assert echoed.headers["x-request-id"] == "abc123"

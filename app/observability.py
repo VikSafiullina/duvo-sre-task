@@ -51,6 +51,9 @@ def setup_logging(level: str) -> None:
 
 _http_log = logging.getLogger("app.http")
 _QUIET_ROUTES = {"/healthz", "/readyz", "/metrics"}
+# Any token is a valid HTTP method, so the method is caller input: unknown ones collapse to
+# OTHER, or `curl -X <random>` would mint a new time series per request.
+_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
 
 async def observe_requests(
@@ -68,8 +71,9 @@ async def observe_requests(
     finally:
         route = getattr(request.scope.get("route"), "path", "unmatched")
         elapsed = time.perf_counter() - start
-        HTTP_REQUESTS.labels(request.method, route, str(status)).inc()
-        HTTP_LATENCY.labels(request.method, route).observe(elapsed)
+        method = request.method if request.method in _METHODS else "OTHER"
+        HTTP_REQUESTS.labels(method, route, str(status)).inc()
+        HTTP_LATENCY.labels(method, route).observe(elapsed)
         if route not in _QUIET_ROUTES:
             _http_log.info(
                 "request",
