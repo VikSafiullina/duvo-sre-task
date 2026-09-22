@@ -27,11 +27,41 @@ Look for one route/error class dominating; open a ticket, fix in normal hours.
 
 **Mitigate:** fix/rollback · pause producers · request new sandboxes once fixed (failed rows keep the `error`; `GET /sandboxes/{id}` shows why).
 
-## QueueBacklogGrowing
-1. Are workers up (`up{job="duvo-worker"}`) and processing (jobs/s panel)?
-2. Did the arrival rate spike, or did job duration grow?
+## SandboxQueueStalled
+**Meaning:** a sandbox request has waited > 60s for a worker to pick it up. Agents are blocked.
+1. Dashboard → "Queue depth by queue" and "Start outcomes / s": is anything being consumed at all?
+2. Worker up? `up{job="duvo-worker"}`, `make ps`, `make logs`. A crash loop at startup is often
+   Docker: the worker fails fast if the socket is unreachable.
+3. Throughput dropped but not zero → "Job p95 duration": are starts slow (image pull, readiness)?
 
-**Mitigate:** scale the worker pool · find the slow dependency · shed or defer low-priority work.
+**Mitigate:** restart/roll back the worker · scale workers (`max_jobs`) · if Docker is the cause,
+fix the daemon. Requests past their TTL are skipped automatically, not started late.
+
+## SandboxStartSlow
+**Meaning:** p95 request → serving is above the 10s freshness SLO for 10m.
+1. Split the time: "Queue wait p95" (queueing) vs "Job p95 duration" (container start + readiness).
+2. Queueing → see SandboxQueueStalled / SandboxCapacityHigh. Starting → worker logs
+   `|= "sandbox running"` show `time_to_running_s` per sandbox; traces show slow Docker calls vs probes.
+3. Image pulls: did `SANDBOX_IMAGE` change or the host lose its cache? (`image pre-pull failed` log)
+
+**Mitigate:** pre-pull the image · add worker capacity · roll back a slow sandbox image.
+
+## SandboxStuckInTransition
+**Meaning:** a sandbox has been `starting` or `stopping` for > 2 min, longer than any legit start
+(~45s worst case) or stop. Usually a job killed by `job_timeout` mid-flight.
+1. `GET /sandboxes?limit=100` → find it; worker logs by `sandbox_id`.
+2. `make sandboxes` → does its container exist?
+
+**Mitigate:** `stopping` resolves on the next reaper sweep. A stuck `starting` is cleaned up at
+TTL; to free it now, `DELETE /sandboxes/{id}`.
+
+## SandboxCapacityHigh
+**Meaning:** > 80% of `SANDBOX_MAX_ACTIVE` in use for 10m. At 100% `POST /sandboxes` answers 429.
+1. Real demand (request rate up) or leak (long TTLs, stops not completing)? "Sandboxes by status".
+2. Many `stopping` → the stop path is broken (see SandboxReaperFailing).
+
+**Mitigate:** raise the cap if the host has headroom (memory ≈ cap × `SANDBOX_MEMORY`) · add hosts ·
+ask heavy callers for shorter `ttl_s`.
 
 ## TargetDown
 1. `make ps` — container crashed or restarting? `docker compose logs <svc> | tail`.

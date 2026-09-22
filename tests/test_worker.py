@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 from arq import Retry
+from prometheus_client import REGISTRY
 
 from app.config import Settings
 from app.db import make_engine, make_sessionmaker
@@ -139,6 +140,30 @@ async def test_stop_during_launch_discards_the_new_container(ctx: dict[str, Any]
 
 async def test_start_for_missing_sandbox_is_noop(ctx: dict[str, Any]) -> None:
     assert await start_sandbox(ctx, str(uuid.uuid4()), {}) == "missing"
+
+
+def _sample(name: str, **labels: str) -> float:
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+async def test_start_records_time_to_running(ctx: dict[str, Any]) -> None:
+    before = _sample("sandbox_time_to_running_seconds_count")
+    await start_sandbox(ctx, str(await _add(ctx)), {})
+    assert _sample("sandbox_time_to_running_seconds_count") == before + 1
+
+
+async def test_queue_wait_measured_on_first_try_only(ctx: dict[str, Any]) -> None:
+    """Retries wait on purpose (backoff): counting them would fake queue pressure."""
+    count = ("job_queue_wait_seconds_count", {"task": "start_sandbox"})
+    total = ("job_queue_wait_seconds_sum", {"task": "start_sandbox"})
+    before_n, before_sum = _sample(count[0], **count[1]), _sample(total[0], **total[1])
+    ctx["enqueue_time"] = datetime.now(UTC) - timedelta(seconds=3)
+    await start_sandbox(ctx, str(await _add(ctx)), {})
+    assert _sample(count[0], **count[1]) == before_n + 1
+    assert _sample(total[0], **total[1]) - before_sum >= 3
+    ctx["job_try"] = 2
+    await start_sandbox(ctx, str(await _add(ctx)), {})
+    assert _sample(count[0], **count[1]) == before_n + 1
 
 
 # --- stop_sandbox ----------------------------------------------------------------------

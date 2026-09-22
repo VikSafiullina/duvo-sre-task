@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from tests.support import metric
 
 
 def _create(client: TestClient, **body: object) -> str:
@@ -94,9 +95,8 @@ def test_delete_marks_stopping_and_enqueues_stop_once(client: TestClient) -> Non
         r = client.delete(f"/sandboxes/{sandbox_id}")
         assert r.status_code == 202
         assert r.json()["status"] == "stopping"
-    body = client.get("/metrics").text
-    assert "queue_depth 2.0" in body  # one start + one stop
-    assert 'jobs_enqueued_total{job="stop_sandbox",outcome="enqueued"}' in body
+    assert metric(client, "queue_depth", queue="arq:queue") == 2  # one start + one stop
+    assert metric(client, "jobs_enqueued_total", task="stop_sandbox", outcome="enqueued")
 
 
 def test_delete_of_settled_sandbox_is_noop(client: TestClient, app: FastAPI) -> None:
@@ -110,7 +110,7 @@ def test_delete_of_settled_sandbox_is_noop(client: TestClient, app: FastAPI) -> 
     [sandbox] = client.get("/sandboxes").json()
     r = client.delete(f"/sandboxes/{sandbox['id']}")
     assert (r.status_code, r.json()["status"]) == (202, "failed")
-    assert "queue_depth 0.0" in client.get("/metrics").text
+    assert metric(client, "queue_depth", queue="arq:queue") == 0
 
 
 def test_delete_missing_sandbox_404(client: TestClient) -> None:

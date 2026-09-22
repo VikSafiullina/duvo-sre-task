@@ -2,6 +2,8 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 
+from fastapi.testclient import TestClient
+from prometheus_client.parser import text_string_to_metric_families
 from redis.asyncio import Redis
 
 from app.config import Settings
@@ -50,3 +52,12 @@ class FakeRuntime:
         if self.list_error:
             raise self.list_error
         return [RuntimeSandbox(sid, exp) for sid, exp in self.containers.items()]
+
+
+def metric(client: TestClient, name: str, **labels: str) -> float | None:
+    """One sample from /metrics, matched on exact labels (exposition order doesn't matter)."""
+    for family in text_string_to_metric_families(client.get("/metrics").text):
+        for sample in family.samples:
+            if sample.name == name and sample.labels == labels:
+                return sample.value
+    return None

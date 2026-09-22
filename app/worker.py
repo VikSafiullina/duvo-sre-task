@@ -28,7 +28,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import make_engine, make_sessionmaker
-from app.metrics import JOB_LATENCY, JOBS, RECONCILE_RUNS, SANDBOXES_REAPED
+from app.metrics import (
+    JOB_LATENCY,
+    JOB_QUEUE_WAIT,
+    JOBS,
+    RECONCILE_RUNS,
+    SANDBOXES_REAPED,
+    TIME_TO_RUNNING,
+)
 from app.models import ACTIVE_STATUSES, Sandbox, SandboxStatus
 from app.observability import setup_logging
 from app.queue import START_SANDBOX, STOP_SANDBOX, redis_settings
@@ -72,6 +79,13 @@ async def _discard(runtime: SandboxRuntime, sandbox_id: uuid.UUID) -> None:
         )
 
 
+def _observe_queue_wait(ctx: dict[str, Any], job: str) -> None:
+    """First try only: a retry's wait is our own backoff, not queue pressure."""
+    enqueued: datetime | None = ctx.get("enqueue_time")
+    if ctx["job_try"] == 1 and enqueued is not None:
+        JOB_QUEUE_WAIT.labels(job).observe(max(0.0, (datetime.now(UTC) - enqueued).total_seconds()))
+
+
 async def _launch(runtime: SandboxRuntime, sandbox: Sandbox, failure_rate: float) -> str:
     if random.random() < failure_rate:
         raise ChaosError("injected failure")
@@ -87,6 +101,7 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
     with span_ctx as span:
         span.set_attribute("sandbox.id", sandbox_id)
         span.set_attribute("job.try", job_try)
+        _observe_queue_wait(ctx, START_SANDBOX)
         start = time.perf_counter()
         try:
             async with ctx["sessionmaker"]() as session:
@@ -157,9 +172,16 @@ async def start_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[st
                     )
                     return "cancelled"
                 JOBS.labels(START_SANDBOX, "success").inc()
+                waited = (datetime.now(UTC) - sandbox.created_at).total_seconds()
+                TIME_TO_RUNNING.observe(waited)
                 log.info(
                     "sandbox running",
-                    extra={"sandbox_id": sandbox_id, "url": url, "job_try": job_try},
+                    extra={
+                        "sandbox_id": sandbox_id,
+                        "url": url,
+                        "job_try": job_try,
+                        "time_to_running_s": round(waited, 2),
+                    },
                 )
                 return "running"
         finally:
@@ -174,6 +196,7 @@ async def stop_sandbox(ctx: dict[str, Any], sandbox_id: str, trace_ctx: dict[str
     span_ctx = tracer.start_as_current_span(STOP_SANDBOX, context=parent, kind=SpanKind.CONSUMER)
     with span_ctx as span:
         span.set_attribute("sandbox.id", sandbox_id)
+        _observe_queue_wait(ctx, STOP_SANDBOX)
         start = time.perf_counter()
         try:
             try:

@@ -63,18 +63,61 @@ groups:
           description: "Permanent failure ratio is {{ $value | humanizePercentage }}."
           runbook: docs/RUNBOOK.md#jobfailureratehigh
 
-      - alert: QueueBacklogGrowing
-        expr: max(queue_depth) > 100
+      # Age, not depth: the admission cap bounds depth (~50), and a stuck queue with zero
+      # throughput never shows up in a histogram. Oldest queued sandbox catches both.
+      - alert: SandboxQueueStalled
+        expr: max(sandbox_oldest_in_status_seconds{job="duvo-api",status="queued"}) > 60
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: A sandbox request has waited over a minute for a worker
+          description: "Oldest queued sandbox has waited {{ $value | humanizeDuration }}."
+          runbook: docs/RUNBOOK.md#sandboxqueuestalled
+
+  - name: duvo-sandboxes
+    rules:
+      # Freshness SLI (docs/SLO.md): p95 time from request to a serving sandbox.
+      - record: sandbox:time_to_running:p95_5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(sandbox_time_to_running_seconds_bucket[5m])))
+      - record: sandbox:start_failure:ratio_rate5m
+        expr: |
+          (sum(rate(jobs_total{task="start_sandbox",outcome="failed"}[5m])) or vector(0))
+          / sum(rate(jobs_total{task="start_sandbox",outcome=~"success|failed"}[5m]))
+      - record: sandbox:capacity_used:ratio
+        expr: max(sum by (instance) (sandboxes_active{job="duvo-api"})) / max(sandbox_capacity{job="duvo-api"})
+
+      - alert: SandboxStartSlow
+        expr: sandbox:time_to_running:p95_5m > 10
         for: 10m
         labels:
           severity: ticket
         annotations:
-          summary: Job queue backlog above 100 for 10 minutes
-          description: "Queue depth is {{ $value }}."
-          runbook: docs/RUNBOOK.md#queuebackloggrowing
+          summary: p95 time-to-running above the 10s SLO for 10 minutes
+          description: "p95 request -> serving is {{ $value | humanizeDuration }}."
+          runbook: docs/RUNBOOK.md#sandboxstartslow
 
-  - name: duvo-sandboxes
-    rules:
+      # Longest legit start is ~45s (Docker deadline 30s + readiness 15s); stopping is seconds.
+      - alert: SandboxStuckInTransition
+        expr: max by (status) (sandbox_oldest_in_status_seconds{job="duvo-api",status=~"starting|stopping"}) > 120
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A sandbox has been {{ $labels.status }} for over 2 minutes"
+          description: "Oldest {{ $labels.status }} sandbox: {{ $value | humanizeDuration }}."
+          runbook: docs/RUNBOOK.md#sandboxstuckintransition
+
+      - alert: SandboxCapacityHigh
+        expr: sandbox:capacity_used:ratio > 0.8
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Over 80% of sandbox capacity in use for 10 minutes; 429s are next
+          description: "{{ $value | humanizePercentage }} of SANDBOX_MAX_ACTIVE in use."
+          runbook: docs/RUNBOOK.md#sandboxcapacityhigh
+
       - alert: SandboxLeaked
         expr: sum(increase(sandboxes_reaped_total{reason=~"orphan|vanished"}[15m])) > 0
         labels:

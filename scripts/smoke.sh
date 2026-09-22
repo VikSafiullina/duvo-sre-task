@@ -47,10 +47,14 @@ echo "container gone"
 step "metrics exposed"
 api=$(curl -fsS "$BASE_URL/metrics")
 worker=$(curl -fsS "$WORKER_METRICS")
-grep -q 'jobs_enqueued_total{job="start_sandbox",outcome="enqueued"}' <<<"$api" || fail "producer metrics missing"
+grep -q 'jobs_enqueued_total{outcome="enqueued",task="start_sandbox"}' <<<"$api" || fail "producer metrics missing"
 grep -q 'http_requests_total{method="POST",route="/sandboxes"' <<<"$api" || fail "api metrics missing"
-grep -q 'jobs_total{job="start_sandbox",outcome="success"}' <<<"$worker" || fail "start job metrics missing"
-grep -q 'jobs_total{job="stop_sandbox",outcome="success"}' <<<"$worker" || fail "stop job metrics missing"
+grep -q 'jobs_total{outcome="success",task="start_sandbox"}' <<<"$worker" || fail "start job metrics missing"
+grep -q 'jobs_total{outcome="success",task="stop_sandbox"}' <<<"$worker" || fail "stop job metrics missing"
 grep -q 'sandbox_reconcile_runs_total{outcome="success"}' <<<"$worker" || fail "reaper metrics missing"
+grep -q 'sandbox_time_to_running_seconds_count' <<<"$worker" || fail "freshness SLI missing"
+grep -q 'job_queue_wait_seconds_count{task="start_sandbox"}' <<<"$worker" || fail "queue wait missing"
+grep -q 'sandboxes_active{status="running"}' <<<"$api" || fail "lifecycle gauges missing"
+grep -q 'queue_depth{queue="arq:queue"}' <<<"$api" || fail "per-queue depth missing"
 
 printf '\nOK: smoke passed\n'
