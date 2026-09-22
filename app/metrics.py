@@ -1,6 +1,7 @@
-"""Prometheus metrics. Labels are route templates / enums only — never IDs — so cardinality
-stays bounded no matter what callers send. Never name a label `job` or `instance`: Prometheus
-owns those and renames ours to `exported_job`, silently breaking every query on it."""
+"""Prometheus metrics. Labels are route templates / enums only — never IDs or raw caller
+input (unknown HTTP methods become OTHER) — so cardinality stays bounded no matter what
+callers send. Never name a label `job` or `instance`: Prometheus owns those and renames ours
+to `exported_job`, silently breaking every query on it."""
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -17,6 +18,7 @@ HTTP_LATENCY = Histogram(
 
 # --- Producer + queue ---------------------------------------------------------------------
 # outcome: enqueued | error (Redis down/slow => the sandbox is marked failed)
+# | deduplicated (Idempotency-Key replay: nothing enqueued; a spike = clients retrying)
 JOBS_ENQUEUED = Counter("jobs_enqueued_total", "Jobs handed to the queue", ["task", "outcome"])
 # Sampled by the API at scrape time. Depth alone can't tell "busy" from "stuck", hence the
 # wait histogram and the oldest-in-status gauge below.

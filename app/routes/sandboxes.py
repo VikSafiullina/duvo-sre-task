@@ -6,8 +6,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import QueueDep, SessionDep, SettingsDep
@@ -29,13 +30,51 @@ async def _get_or_404(session: AsyncSession, sandbox_id: uuid.UUID) -> Sandbox:
     return sandbox
 
 
+IdempotencyKey = Annotated[
+    str | None, Header(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
+]
+
+
+def _accepted(sandbox: Sandbox) -> SandboxAccepted:
+    return SandboxAccepted(
+        job_id=sandbox_job_id(START_SANDBOX, sandbox.id),
+        sandbox_id=sandbox.id,
+        type=sandbox.type,
+        status=sandbox.status,
+        expires_at=sandbox.expires_at,
+    )
+
+
+async def _replay(session: AsyncSession, key: str, response: Response) -> SandboxAccepted | None:
+    """The sandbox an earlier request with this Idempotency-Key created, if any."""
+    original = await session.scalar(select(Sandbox).where(Sandbox.idempotency_key == key))
+    if original is None:
+        return None
+    JOBS_ENQUEUED.labels(START_SANDBOX, "deduplicated").inc()
+    log.info("idempotent replay", extra={"sandbox_id": str(original.id)})
+    response.headers["Idempotent-Replayed"] = "true"
+    return _accepted(original)
+
+
 @router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=SandboxAccepted)
 async def create_sandbox(
-    body: SandboxCreate, session: SessionDep, queue: QueueDep, settings: SettingsDep
+    body: SandboxCreate,
+    session: SessionDep,
+    queue: QueueDep,
+    settings: SettingsDep,
+    response: Response,
+    idempotency_key: IdempotencyKey = None,
 ) -> SandboxAccepted:
     """Record the sandbox *before* enqueueing so a fast worker always finds its row. If the
     queue is unreachable the row is marked failed (never left looking "queued" forever) and
-    the caller gets a 503 to retry."""
+    the caller gets a 503 to retry.
+
+    With an `Idempotency-Key`, a retry (client timeout, 503, concurrent duplicate) returns the
+    original sandbox instead of starting another container, even at capacity (the original
+    already holds its slot). The unique constraint settles concurrent duplicates. A replayed
+    `failed` sandbox stays failed: use a new key to try again."""
+    if idempotency_key and (replay := await _replay(session, idempotency_key, response)):
+        return replay
     active = await session.scalar(
         select(func.count()).select_from(Sandbox).where(Sandbox.status.in_(ACTIVE_STATUSES))
     )
@@ -47,9 +86,20 @@ async def create_sandbox(
             headers={"Retry-After": "30"},
         )
     expires_at = datetime.now(UTC) + timedelta(seconds=body.ttl_s)
-    sandbox = Sandbox(type=body.type, status=SandboxStatus.QUEUED, expires_at=expires_at)
+    sandbox = Sandbox(
+        type=body.type,
+        status=SandboxStatus.QUEUED,
+        expires_at=expires_at,
+        idempotency_key=idempotency_key,
+    )
     session.add(sandbox)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()  # a concurrent request with the same key won the insert
+        if idempotency_key and (replay := await _replay(session, idempotency_key, response)):
+            return replay
+        raise
     job_id = sandbox_job_id(START_SANDBOX, sandbox.id)
     try:
         await enqueue_sandbox_job(queue, START_SANDBOX, sandbox.id, settings.redis_timeout_s)
@@ -64,13 +114,7 @@ async def create_sandbox(
         "sandbox requested",
         extra={"sandbox_id": str(sandbox.id), "job_id": job_id, "type": sandbox.type},
     )
-    return SandboxAccepted(
-        job_id=job_id,
-        sandbox_id=sandbox.id,
-        type=sandbox.type,
-        status=sandbox.status,
-        expires_at=sandbox.expires_at,
-    )
+    return _accepted(sandbox)
 
 
 @router.get("", response_model=list[SandboxOut])

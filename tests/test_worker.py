@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -6,6 +7,7 @@ from typing import Any
 import pytest
 from arq import Retry
 from prometheus_client import REGISTRY
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.db import make_engine, make_sessionmaker
@@ -96,6 +98,34 @@ async def test_failed_launch_discards_container_before_retry(ctx: dict[str, Any]
     ctx["job_try"] = ctx["settings"].job_max_tries
     assert await start_sandbox(ctx, str(sid), {}) == "failed"
     assert (await _get(ctx, sid)).error == "SandboxNotReady: no answer within 15s"
+
+
+async def test_hung_launch_times_out_into_retry_path(ctx: dict[str, Any]) -> None:
+    """If arq's job_timeout fired instead, it would cancel the job: no retry, the sandbox
+    stuck in `starting`, and nothing in jobs_total for the failure alert to see."""
+
+    async def hang(sandbox_id: uuid.UUID) -> None:
+        await asyncio.sleep(5)
+
+    runtime: FakeRuntime = ctx["runtime"]
+    runtime.during_launch = hang  # container created, then the launch never finishes
+    ctx["settings"] = ctx["settings"].model_copy(update={"launch_timeout_s": 0.05})
+    sid = await _add(ctx)
+    with pytest.raises(Retry):
+        await start_sandbox(ctx, str(sid), {})
+    sandbox = await _get(ctx, sid)
+    assert sandbox.status == S.QUEUED
+    assert (sandbox.error or "").startswith("TimeoutError")
+    assert runtime.containers == {}  # the half-made container isn't carried into the retry
+    ctx["job_try"] = ctx["settings"].job_max_tries
+    assert await start_sandbox(ctx, str(sid), {}) == "failed"
+    assert (await _get(ctx, sid)).status == S.FAILED
+
+
+def test_launch_timeout_must_leave_room_for_cleanup_inside_job_timeout() -> None:
+    Settings()  # defaults fit: 45 launch + 30 cleanup + 10 DB <= 90
+    with pytest.raises(ValidationError):
+        Settings(launch_timeout_s=45, job_timeout_s=60)  # fits the launch, not the cleanup
 
 
 async def test_success_after_retry_clears_error(ctx: dict[str, Any]) -> None:

@@ -25,6 +25,12 @@ accepted=$(curl -fsS -X POST "$BASE_URL/sandboxes" -H 'content-type: application
 echo "$accepted" | jq -c .
 id=$(echo "$accepted" | jq -r .sandbox_id)
 
+step "retry with the same Idempotency-Key returns the same sandbox"
+key="smoke-$(date +%s)-$$"
+first=$(curl -fsS -X POST "$BASE_URL/sandboxes" -H 'content-type: application/json' -H "Idempotency-Key: $key" -d '{"type":"http","ttl_s":60}' | jq -r .sandbox_id)
+again=$(curl -fsS -X POST "$BASE_URL/sandboxes" -H 'content-type: application/json' -H "Idempotency-Key: $key" -d '{"type":"http","ttl_s":60}' | jq -r .sandbox_id)
+[[ "$first" == "$again" ]] || fail "idempotent retry created a second sandbox ($first vs $again)"
+
 step "invalid request is a 4xx"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/sandboxes" -H 'content-type: application/json' -d '{"type":"ftp"}')
 [[ "$code" == "422" ]] || fail "expected 422 for unknown type, got $code"

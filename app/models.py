@@ -53,6 +53,9 @@ class Sandbox(Base):
     error: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(default=0)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # TTL from creation
+    # Client-supplied Idempotency-Key: a retried POST gets the original sandbox back instead
+    # of a second one. Unique, so concurrent retries race safely on the database.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now

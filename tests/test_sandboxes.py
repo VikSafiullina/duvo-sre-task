@@ -61,6 +61,34 @@ def test_create_rejects_invalid_body(client: TestClient, body: dict[str, object]
     assert client.get("/sandboxes").json() == []  # nothing persisted, nothing enqueued
 
 
+def test_idempotency_key_replays_original_sandbox(client: TestClient) -> None:
+    """A retried create (client timeout, 503) must not start a second container."""
+    headers = {"Idempotency-Key": "agent-7:req-42"}
+    first = client.post("/sandboxes", json={"type": "http"}, headers=headers)
+    replay = client.post("/sandboxes", json={"type": "http"}, headers=headers)
+    assert first.status_code == replay.status_code == 202
+    assert replay.json() == first.json()
+    assert replay.headers["idempotent-replayed"] == "true"
+    assert "idempotent-replayed" not in first.headers
+    assert len(client.get("/sandboxes").json()) == 1
+    assert metric(client, "queue_depth", queue="arq:queue") == 1  # one job, not two
+    assert metric(client, "jobs_enqueued_total", task="start_sandbox", outcome="deduplicated")
+
+
+def test_different_idempotency_keys_create_different_sandboxes(client: TestClient) -> None:
+    for key in ("a", "b"):
+        client.post("/sandboxes", json={"type": "http"}, headers={"Idempotency-Key": key})
+    client.post("/sandboxes", json={"type": "http"})  # no key: no dedupe
+    assert len(client.get("/sandboxes").json()) == 3
+
+
+@pytest.mark.parametrize("key", ["", "x" * 65, "has space", "a/b"])
+def test_idempotency_key_is_bounded(client: TestClient, key: str) -> None:
+    r = client.post("/sandboxes", json={"type": "http"}, headers={"Idempotency-Key": key})
+    assert r.status_code == 422
+    assert client.get("/sandboxes").json() == []
+
+
 def test_create_answers_429_at_capacity(
     client: TestClient, app: FastAPI, settings: Settings
 ) -> None:
@@ -71,6 +99,19 @@ def test_create_answers_429_at_capacity(
     assert r.status_code == 429
     assert r.headers["retry-after"] == "30"
     assert len(client.get("/sandboxes").json()) == 2
+
+
+def test_idempotent_replay_is_not_refused_at_capacity(
+    client: TestClient, app: FastAPI, settings: Settings
+) -> None:
+    """The original already holds its slot: a retry must get it back, not a 429."""
+    app.state.settings = settings.model_copy(update={"sandbox_max_active": 1})
+    headers = {"Idempotency-Key": "agent-7:req-43"}
+    first = client.post("/sandboxes", json={"type": "http"}, headers=headers)
+    replay = client.post("/sandboxes", json={"type": "http"}, headers=headers)
+    assert replay.status_code == 202
+    assert replay.json()["sandbox_id"] == first.json()["sandbox_id"]
+    assert client.post("/sandboxes", json={"type": "http"}).status_code == 429
 
 
 def test_get_missing_sandbox_404(client: TestClient) -> None:
