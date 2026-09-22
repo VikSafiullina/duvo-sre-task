@@ -1,0 +1,15 @@
+.git
+.venv
+.github
+.claude
+__pycache__
+.pytest_cache
+.ruff_cache
+infra
+docs
+tests
+loadtest
+observability
+scripts
+*.md
+.env

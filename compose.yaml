@@ -1,0 +1,108 @@
+name: duvo
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/app
+  REDIS_URL: redis://redis:6379/0
+  ENVIRONMENT: local
+  LOG_LEVEL: INFO
+  CHAOS_FAILURE_RATE: ${CHAOS_FAILURE_RATE:-0}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_TRACES_EXPORTER: otlp_proto_http
+  OTEL_LOGS_EXPORTER: otlp_proto_http
+  OTEL_METRICS_EXPORTER: none # metrics are Prometheus-pull; OTel carries traces + logs
+  OTEL_PYTHON_FASTAPI_EXCLUDED_URLS: "healthz,readyz,metrics"
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=local
+  OTEL_BSP_SCHEDULE_DELAY: "1000" # flush spans every 1s so demos feel live
+
+x-app: &app
+  build: .
+  image: duvo-app:local
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE_NAME: duvo-api
+      OTEL_SERVICE_NAME: duvo-api
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      lgtm: { condition: service_started }
+
+  worker:
+    <<: *app
+    command: ["opentelemetry-instrument", "python", "-m", "app.worker"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: duvo-worker
+      OTEL_SERVICE_NAME: duvo-worker
+      OTEL_PYTHON_DISABLED_INSTRUMENTATIONS: redis # arq polls Redis constantly: pure trace noise
+    ports: ["9100:9100"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      api: { condition: service_healthy } # api owns schema creation
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000" # Grafana
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "9090:9090" # Prometheus UI (alerts)
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /otel-lgtm/grafana/conf/provisioning/dashboards/custom/service.json
+    volumes:
+      - ./observability/prometheus/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
+      - ./observability/prometheus/rules.yml:/otel-lgtm/rules.yml:ro
+      - ./observability/grafana/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/custom.yaml:ro
+      - ./observability/grafana/service.json:/otel-lgtm/grafana/conf/provisioning/dashboards/custom/service.json:ro
+
+  k6:
+    image: grafana/k6:latest
+    profiles: ["load"]
+    command: ["run", "--quiet", "/scripts/k6.js"]
+    environment:
+      BASE_URL: http://api:8000
+    volumes:
+      - ./loadtest:/scripts:ro
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  pgdata:

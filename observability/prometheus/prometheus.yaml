@@ -1,0 +1,27 @@
+# Replaces the default config inside grafana/otel-lgtm: keeps OTLP ingestion, adds our
+# scrape targets and SLO alert rules.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+otlp:
+  keep_identifying_resource_attributes: true
+  promote_resource_attributes:
+    - service.name
+    - service.instance.id
+    - deployment.environment.name
+
+storage:
+  tsdb:
+    out_of_order_time_window: 10m
+
+rule_files:
+  - /otel-lgtm/rules.yml
+
+scrape_configs:
+  - job_name: duvo-api
+    static_configs:
+      - targets: ["api:8000"]
+  - job_name: duvo-worker
+    static_configs:
+      - targets: ["worker:9100"]

@@ -1,0 +1,4 @@
+project_id = "my-gcp-project"
+image      = "europe-west1-docker.pkg.dev/my-gcp-project/duvo-app/app:REPLACE_WITH_GIT_SHA"
+# allow_unauthenticated = true
+# otlp_endpoint         = "https://otel-collector.example.com"

@@ -1,0 +1,86 @@
+# SLO: 99.5% of API requests (excluding probes/metrics) succeed (non-5xx) over 30 days.
+# Error budget = 0.5%. Multi-window, multi-burn-rate alerts per the Google SRE workbook.
+groups:
+  - name: duvo-api-slo
+    rules:
+      - record: slo:api_errors:ratio_rate5m
+        expr: |
+          (sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics",status=~"5.."}[5m])) or vector(0))
+          / sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics"}[5m]))
+      - record: slo:api_errors:ratio_rate30m
+        expr: |
+          (sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics",status=~"5.."}[30m])) or vector(0))
+          / sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics"}[30m]))
+      - record: slo:api_errors:ratio_rate1h
+        expr: |
+          (sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics",status=~"5.."}[1h])) or vector(0))
+          / sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics"}[1h]))
+      - record: slo:api_errors:ratio_rate6h
+        expr: |
+          (sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics",status=~"5.."}[6h])) or vector(0))
+          / sum(rate(http_requests_total{job="duvo-api",route!~"/healthz|/readyz|/metrics"}[6h]))
+
+      - alert: ApiErrorBudgetFastBurn
+        expr: slo:api_errors:ratio_rate1h > (14.4 * 0.005) and slo:api_errors:ratio_rate5m > (14.4 * 0.005)
+        labels:
+          severity: page
+        annotations:
+          summary: API burning its error budget 14x too fast (budget gone in ~2 days)
+          description: "5xx ratio over 1h is {{ $value | humanizePercentage }}."
+          runbook: docs/RUNBOOK.md#apierrorbudgetfastburn
+
+      - alert: ApiErrorBudgetSlowBurn
+        expr: slo:api_errors:ratio_rate6h > (6 * 0.005) and slo:api_errors:ratio_rate30m > (6 * 0.005)
+        labels:
+          severity: ticket
+        annotations:
+          summary: API burning its error budget 6x too fast (budget gone in ~5 days)
+          description: "5xx ratio over 6h is {{ $value | humanizePercentage }}."
+          runbook: docs/RUNBOOK.md#apierrorbudgetslowburn
+
+      - alert: ApiLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="duvo-api",route!~"/healthz|/readyz|/metrics"}[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: API p95 latency above 500ms for 10 minutes
+          description: "p95 is {{ $value | humanizeDuration }}."
+          runbook: docs/RUNBOOK.md#apilatencyhigh
+
+  - name: duvo-worker
+    rules:
+      - alert: JobFailureRateHigh
+        expr: |
+          sum(rate(jobs_total{outcome="failed"}[15m]))
+          / sum(rate(jobs_total{outcome=~"success|failed"}[15m])) > 0.05
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: More than 5% of background jobs fail permanently
+          description: "Permanent failure ratio is {{ $value | humanizePercentage }}."
+          runbook: docs/RUNBOOK.md#jobfailureratehigh
+
+      - alert: QueueBacklogGrowing
+        expr: max(queue_depth) > 100
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Job queue backlog above 100 for 10 minutes
+          description: "Queue depth is {{ $value }}."
+          runbook: docs/RUNBOOK.md#queuebackloggrowing
+
+  - name: duvo-targets
+    rules:
+      - alert: TargetDown
+        expr: up{job=~"duvo-.*"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }} is not being scraped"
+          description: "Prometheus cannot reach {{ $labels.instance }}."
+          runbook: docs/RUNBOOK.md#targetdown
