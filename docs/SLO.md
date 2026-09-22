@@ -27,6 +27,16 @@ so it goes red for a stalled queue, a slow image pull or a broken sandbox image 
 
 The short window makes alerts reset quickly after recovery; the long window stops brief spikes from paging anyone.
 
+## Known gaps
+- Only the API SLOs have burn-rate alerts. The sandbox SLOs use thresholds: `JobFailureRateHigh` pages at about
+  5× burn, and `SandboxStartSlow` opens a ticket at 1× burn (p95 > 10s). A slow leak that stays under those
+  thresholds for days is invisible until the budget is gone.
+- `sandbox_time_to_running_seconds` has buckets at 8s and 13s but none at 10s, so "serving within 10s" can only be
+  interpolated. Add a `10` bucket before measuring the budget from it.
+- `JobFailureRateHigh` counts `stop_sandbox` failures too, while the SLI is defined on `start_sandbox` only.
+  Add `task="start_sandbox"` to the alert.
+- There's no SLO for the A/B rollout yet. Canary health is the input to step 5, which was cut.
+
 ## Error budget policy
 - Budget left: ship normally.
 - Budget < 25%: reliability work gets priority in planning; risky rollouts need a rollback plan.
