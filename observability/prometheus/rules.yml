@@ -64,14 +64,30 @@ groups:
           runbook: docs/RUNBOOK.md#jobfailureratehigh
 
       - alert: QueueBacklogGrowing
-        expr: max(queue_depth) > 100
+        expr: max by (deployment) (queue_depth{job="duvo-api"}) > 100
         for: 10m
         labels:
           severity: ticket
         annotations:
-          summary: Job queue backlog above 100 for 10 minutes
+          summary: "{{ $labels.deployment }} job queue backlog above 100 for 10 minutes"
           description: "Queue depth is {{ $value }}."
           runbook: docs/RUNBOOK.md#queuebackloggrowing
+
+      # A/B: every job routed to a pool that is down or wedged is stranded; with a canary
+      # weight > 0 that's a slice of users whose sandboxes never start. Depth alone can't
+      # tell busy from dead; "has due jobs, finished none in 5m" can. Absent series (pool
+      # never scraped) count as "finished none".
+      - alert: QueueNotDraining
+        expr: |
+          (max by (deployment) (queue_depth{job="duvo-api"}) > 0)
+          unless on (deployment) (sum by (deployment) (rate(jobs_total[5m])) > 0)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.deployment }} pool has queued jobs but finished none in 5m"
+          description: "{{ $value }} due jobs waiting on the {{ $labels.deployment }} pool."
+          runbook: docs/RUNBOOK.md#queuenotdraining
 
   - name: duvo-sandboxes
     rules:

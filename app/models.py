@@ -23,6 +23,13 @@ class SandboxType(enum.StrEnum):
     HTTP = "http"
 
 
+class Deployment(enum.StrEnum):
+    """Worker pools. Each consumes its own queue; the producer splits jobs between them."""
+
+    STABLE = "stable"
+    CANARY = "canary"
+
+
 class SandboxStatus(enum.StrEnum):
     QUEUED = "queued"
     STARTING = "starting"
@@ -52,6 +59,10 @@ class Sandbox(Base):
     url: Mapped[str | None] = mapped_column(String(200))  # set once the server answers
     error: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(default=0)
+    # Pool the start job was routed to (see app/rollout.py).
+    deployment: Mapped[Deployment] = mapped_column(
+        _str_enum(Deployment), default=Deployment.STABLE, server_default=Deployment.STABLE.value
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # TTL from creation
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(

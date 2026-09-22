@@ -5,12 +5,14 @@ from typing import Any
 
 import pytest
 from arq import Retry
+from prometheus_client import REGISTRY
 
 from app.config import Settings
 from app.db import make_engine, make_sessionmaker
-from app.models import Sandbox, SandboxStatus, SandboxType
+from app.models import Deployment, Sandbox, SandboxStatus, SandboxType
+from app.queue import QUEUES, START_SANDBOX
 from app.runtime import SandboxNotReady
-from app.worker import reconcile_sandboxes, start_sandbox, stop_sandbox
+from app.worker import WorkerSettings, reconcile_sandboxes, start_sandbox, stop_sandbox
 from tests.support import FakeRuntime, reset_state
 
 S = SandboxStatus
@@ -139,6 +141,20 @@ async def test_stop_during_launch_discards_the_new_container(ctx: dict[str, Any]
 
 async def test_start_for_missing_sandbox_is_noop(ctx: dict[str, Any]) -> None:
     assert await start_sandbox(ctx, str(uuid.uuid4()), {}) == "missing"
+
+
+async def test_outcomes_are_labelled_with_the_workers_pool(ctx: dict[str, Any]) -> None:
+    """The rollout compares pools on this label, so a canary must never count as stable."""
+    ctx["settings"] = ctx["settings"].model_copy(update={"deployment": Deployment.CANARY})
+    labels = {"job": START_SANDBOX, "outcome": "success", "deployment": "canary"}
+    before = REGISTRY.get_sample_value("jobs_total", labels) or 0.0
+    sid = await _add(ctx)
+    assert await start_sandbox(ctx, str(sid), {}) == "running"
+    assert REGISTRY.get_sample_value("jobs_total", labels) == before + 1
+
+
+def test_worker_consumes_its_own_pools_queue() -> None:
+    assert WorkerSettings.queue_name == QUEUES[Settings().deployment] == "arq:queue"
 
 
 # --- stop_sandbox ----------------------------------------------------------------------

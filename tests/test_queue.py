@@ -12,8 +12,8 @@ from app.queue import START_SANDBOX, enqueue_sandbox_job, redis_settings
 def test_create_enqueues_one_job_and_counts_it(client: TestClient) -> None:
     assert client.post("/sandboxes", json={"type": "http"}).status_code == 202
     body = client.get("/metrics").text
-    assert "queue_depth 1.0" in body
-    assert 'jobs_enqueued_total{job="start_sandbox",outcome="enqueued"}' in body
+    assert 'queue_depth{deployment="stable"} 1.0' in body
+    assert 'jobs_enqueued_total{deployment="stable",job="start_sandbox",outcome="enqueued"}' in body
 
 
 async def test_enqueue_is_idempotent_per_sandbox(settings: Settings) -> None:
@@ -37,7 +37,10 @@ def test_queue_down_returns_503_and_marks_sandbox_failed(client: TestClient, app
     [sandbox] = client.get("/sandboxes").json()
     assert sandbox["status"] == "failed"
     assert sandbox["error"] == "enqueue: ConnectionError"
-    assert 'jobs_enqueued_total{job="start_sandbox",outcome="error"}' in client.get("/metrics").text
+    assert (
+        'jobs_enqueued_total{deployment="stable",job="start_sandbox",outcome="error"}'
+        in client.get("/metrics").text
+    )
 
 
 def test_slow_queue_times_out_instead_of_hanging(

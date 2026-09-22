@@ -20,7 +20,11 @@ def test_create_accepts_and_get_returns_queued_sandbox(client: TestClient) -> No
     accepted = r.json()
     sandbox_id = accepted["sandbox_id"]
     assert accepted["job_id"] == f"start_sandbox:{sandbox_id}"
-    assert (accepted["type"], accepted["status"]) == ("http", "queued")
+    assert (accepted["type"], accepted["status"], accepted["deployment"]) == (
+        "http",
+        "queued",
+        "stable",
+    )
     sandbox = client.get(f"/sandboxes/{sandbox_id}").json()
     assert (sandbox["status"], sandbox["url"], sandbox["attempts"]) == ("queued", None, 0)
 
@@ -95,8 +99,8 @@ def test_delete_marks_stopping_and_enqueues_stop_once(client: TestClient) -> Non
         assert r.status_code == 202
         assert r.json()["status"] == "stopping"
     body = client.get("/metrics").text
-    assert "queue_depth 2.0" in body  # one start + one stop
-    assert 'jobs_enqueued_total{job="stop_sandbox",outcome="enqueued"}' in body
+    assert 'queue_depth{deployment="stable"} 2.0' in body  # one start + one stop
+    assert 'jobs_enqueued_total{deployment="stable",job="stop_sandbox",outcome="enqueued"}' in body
 
 
 def test_delete_of_settled_sandbox_is_noop(client: TestClient, app: FastAPI) -> None:
@@ -110,7 +114,7 @@ def test_delete_of_settled_sandbox_is_noop(client: TestClient, app: FastAPI) -> 
     [sandbox] = client.get("/sandboxes").json()
     r = client.delete(f"/sandboxes/{sandbox['id']}")
     assert (r.status_code, r.json()["status"]) == (202, "failed")
-    assert "queue_depth 0.0" in client.get("/metrics").text
+    assert 'queue_depth{deployment="stable"} 0.0' in client.get("/metrics").text
 
 
 def test_delete_missing_sandbox_404(client: TestClient) -> None:

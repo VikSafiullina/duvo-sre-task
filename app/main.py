@@ -12,7 +12,7 @@ from app.config import Settings, get_settings
 from app.db import create_schema, make_engine, make_sessionmaker
 from app.observability import observe_requests, setup_logging
 from app.queue import redis_settings
-from app.routes import health, metrics, sandboxes
+from app.routes import health, metrics, rollout, sandboxes
 
 log = logging.getLogger("app")
 
@@ -39,6 +39,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(metrics.router)
     app.include_router(sandboxes.router)
+    app.include_router(rollout.router)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception) -> JSONResponse:
